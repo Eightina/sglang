@@ -10,10 +10,10 @@ Pure CPU test — no kernels involved; the factory only assigns dataclass
 fields. CUDA-only attribute (tensor `.device`) is exercised against the CPU
 device for determinism.
 
-Parity is the primary acceptance criterion for the 06.a landing PR per the
-L3 plan; once the call sites flip in 06.b / 06.c, this suite acts as a
-regression net against silent drift between the factory and any future
-ad-hoc construction at a capture entry point.
+Parity is the primary acceptance criterion for this change: it mirrors each
+original constructor verbatim, so once the call sites switch to the factory
+this suite acts as a regression net against silent drift between the factory
+and any future ad-hoc construction at a capture entry point.
 """
 
 import dataclasses
