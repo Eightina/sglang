@@ -54,6 +54,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_buffer_registry import build_prefill_registry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CaptureKind,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
@@ -334,9 +335,11 @@ class PiecewiseCudaGraphRunner:
             else None
         )
         with torch.device(self.device):
-            forward_batch = ForwardBatch(
+            forward_batch = ForwardBatch.init_for_capture(
+                capture_kind=CaptureKind.PIECEWISE_WARMUP_COMPILE,
+                bs=1,
+                num_tokens=num_tokens,
                 forward_mode=ForwardMode.EXTEND,
-                batch_size=1,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 req_pool_indices=torch.arange(1, device=self.device),
@@ -350,7 +353,6 @@ class PiecewiseCudaGraphRunner:
                 mamba_track_mask=mamba_track_mask,
                 mamba_track_seqlens=mamba_track_seqlens,
                 encoder_lens=None,
-                return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([0], device=self.device),
@@ -505,9 +507,11 @@ class PiecewiseCudaGraphRunner:
             lora_ids = None
 
         with torch.device(self.device):
-            forward_batch = ForwardBatch(
+            forward_batch = ForwardBatch.init_for_capture(
+                capture_kind=CaptureKind.PIECEWISE_GRAPH,
+                bs=bs,
+                num_tokens=num_tokens,
                 forward_mode=ForwardMode.EXTEND,
-                batch_size=bs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
@@ -521,7 +525,6 @@ class PiecewiseCudaGraphRunner:
                 mamba_track_mask=mamba_track_mask,
                 mamba_track_seqlens=mamba_track_seqlens,
                 encoder_lens=None,
-                return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([0], device=self.device),
