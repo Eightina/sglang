@@ -243,6 +243,7 @@ class BreakableCudaGraphRunner:
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
         from sglang.srt.model_executor.forward_batch_info import (
+            CaptureKind,
             ForwardBatch,
             ForwardMode,
         )
@@ -269,9 +270,11 @@ class BreakableCudaGraphRunner:
             req_pool_indices = torch.arange(bs, dtype=torch.int64)
             orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
 
-        return ForwardBatch(
+        return ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.BREAKABLE_GRAPH,
+            bs=bs,
+            num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
-            batch_size=bs,
             input_ids=_slot("input_ids"),
             input_embeds=(
                 _slot("input_embeds") if registry.has_slot("input_embeds") else None
@@ -287,7 +290,6 @@ class BreakableCudaGraphRunner:
             mamba_track_mask=None,
             mamba_track_seqlens=None,
             encoder_lens=None,
-            return_logprob=False,
             extend_num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
