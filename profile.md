@@ -31,6 +31,17 @@
     --max-concurrency 64 \
     --output-file ./baseline-pp2tp2/baseline_short.jsonl
 
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 --port 8000 \
+    --model /root/.cache/modelscope/hub/models/qwen/qwen3___5-27b-fp8 \
+    --dataset-name random-ids \
+    --random-input-len 256 --random-output-len 64 \
+    --num-prompts 200 \
+    --request-rate inf \
+    --max-concurrency 64 \
+    --output-file ./mybench/og-pdtp2/og_short.jsonl
+
   ### 场景 2：长输入长输出（接近真实 LLM 使用）
   python3 -m sglang.bench_serving \
     --backend sglang \
@@ -42,6 +53,17 @@
     --request-rate inf \
     --max-concurrency 32 \
     --output-file ./baseline-pp2tp2/baseline_long.jsonl
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 --port 8000 \
+    --model /root/.cache/modelscope/hub/models/qwen/qwen3___5-27b-fp8 \
+    --dataset-name random-ids \
+    --random-input-len 1024 --random-output-len 512 \
+    --num-prompts 100 \
+    --request-rate inf \
+    --max-concurrency 32 \
+    --output-file ./mybench/og-pdtp2/og_long.jsonl
 
   <!-- ### 场景 3：真实对话分布（ShareGPT 数据集）
   python3 -m sglang.bench_serving \
