@@ -1,0 +1,8 @@
+model-path: qwen/qwen3.5-27b-fp8
+host: 0.0.0.0
+port: 30000
+tensor-parallel-size: 2
+disaggregation-mode: prefill
+disaggregation-transfer-backend: nixl
+enable-metrics: true
+log-requests: true

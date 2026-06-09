@@ -1,0 +1,9 @@
+model-path: qwen/qwen3.5-27b-fp8
+host: 0.0.0.0
+port: 30001
+tensor-parallel-size: 2
+base-gpu-id: 2
+disaggregation-mode: decode
+disaggregation-transfer-backend: nixl
+enable-metrics: true
+log-requests: true
