@@ -6,11 +6,13 @@ import requests
 
 def test_basic(host="127.0.0.1", port=30000, stream=False):
     """Basic chat completion test"""
+    # Strip http:// or https:// prefix if present
+    host = host.replace("http://", "").replace("https://", "")
     url = f"http://{host}:{port}/v1/chat/completions"
 
     data = {
         # "model": "qwen/qwen3-0.6b",
-        "model": "qwen/qwen3.6-27b-fp8",
+        "model": "qwen/qwen3.5-27b-fp8",
         "messages": [{"role": "user", "content": "What is the capital of France?"}],
         "stream": stream,
     }
@@ -46,6 +48,7 @@ def test_basic(host="127.0.0.1", port=30000, stream=False):
 
 def test_health(host="127.0.0.1", port=30000):
     """Test health endpoint"""
+    host = host.replace("http://", "").replace("https://", "")
     url = f"http://{host}:{port}/health"
     try:
         response = requests.get(url, timeout=5)
@@ -56,6 +59,7 @@ def test_health(host="127.0.0.1", port=30000):
 
 def test_model_info(host="127.0.0.1", port=30000):
     """Test model info endpoint"""
+    host = host.replace("http://", "").replace("https://", "")
     url = f"http://{host}:{port}/model_info"
     try:
         response = requests.get(url, timeout=5)
