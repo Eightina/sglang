@@ -1,6 +1,6 @@
 model-path: qwen/qwen3.5-27b-fp8
 host: 0.0.0.0
-port: 30000
+port: 8000
 tensor-parallel-size: 4
 enable-metrics: true
 log-requests: true

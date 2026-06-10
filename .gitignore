@@ -189,7 +189,7 @@ tl_out/
 
 # personnal
 work_dirs/
-*.csv
+# *.csv
 
 !logo.png
 !docs_new/images/*.png

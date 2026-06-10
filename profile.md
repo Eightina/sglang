@@ -65,6 +65,39 @@
     --max-concurrency 32 \
     --output-file ./mybench/og-pdtp2/og_long.jsonl
 
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 --port 8000 \
+    --model /root/.cache/modelscope/hub/models/qwen/qwen3___5-27b-fp8 \
+    --dataset-name random-ids \
+    --random-input-len 2048 --random-output-len 100 \
+    --num-prompts 100 \
+    --request-rate inf \
+    --max-concurrency 32 \
+    --output-file ./mybench/og-pdtp2/og_agent.jsonl
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 --port 8000 \
+    --model /root/.cache/modelscope/hub/models/qwen/qwen3___5-27b-fp8 \
+    --dataset-name random-ids \
+    --random-input-len 2048 --random-output-len 200 \
+    --num-prompts 200 \
+    --request-rate inf \
+    --max-concurrency 64 \
+    --output-file ./mybench/og-pdtp2/og_agent_high.jsonl
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 --port 8000 \
+    --model /root/.cache/modelscope/hub/models/qwen/qwen3___5-27b-fp8 \
+    --dataset-name random-ids \
+    --random-input-len 4096 --random-output-len 1024 \
+    --num-prompts 100 \
+    --request-rate inf \
+    --max-concurrency 32 \
+    --output-file ./mybench/og-pdtp2/og_rag.jsonl
+
   <!-- ### 场景 3：真实对话分布（ShareGPT 数据集）
   python3 -m sglang.bench_serving \
     --backend sglang \
