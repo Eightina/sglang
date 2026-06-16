@@ -1,0 +1,53 @@
+benchmark_args=Namespace(backend='sglang', base_url=None, host='127.0.0.1', port=8000, ready_check_timeout_sec=60, dataset_name='random-ids', dataset_path='', speed_bench_category=None, speed_bench_output_len=512, model=None, served_model_name=None, tokenizer=None, num_prompts=50, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=4096, random_output_len=512, random_range_ratio=0.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=16, output_file='./mybench/kv-transfer-measurement/20260614_133930/benchmark_results.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, seed=1, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag=None, header=None)
+Waiting up to 60s for http://127.0.0.1:8000/v1/models to become ready...
+Server ready in 0.0s.
+Fail to load tokenizer config with error=Can't load tokenizer for 'qwen/qwen3.5-27b-fp8'. If you were trying to load it from 'https://huggingface.co/models', make sure you don't have a local directory with the same name. Otherwise, make sure 'qwen/qwen3.5-27b-fp8' is the correct path to a directory containing all relevant files for a Qwen2Tokenizer tokenizer.
+
+WARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.
+Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.
+
+Namespace(backend='sglang', base_url=None, host='127.0.0.1', port=8000, ready_check_timeout_sec=60, dataset_name='random-ids', dataset_path='', speed_bench_category=None, speed_bench_output_len=512, model='qwen/qwen3.5-27b-fp8', served_model_name=None, tokenizer=None, num_prompts=50, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=4096, random_output_len=512, random_range_ratio=0.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=16, output_file='./mybench/kv-transfer-measurement/20260614_133930/benchmark_results.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, seed=1, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag=None, header=None)
+
+Downloading Model from https://www.modelscope.cn to directory: /root/.cache/modelscope/hub/models/qwen/qwen3.5-27b-fp8
+#Input tokens: 108875
+#Output tokens: 12342
+Starting warmup with 1 sequences...
+Warmup completed with 1 sequences. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang    
+Traffic request rate:                    inf       
+Max request concurrency:                 16        
+Successful requests:                     50        
+Benchmark duration (s):                  42.51     
+Total input tokens:                      108875    
+Total input text tokens:                 108875    
+Total generated tokens:                  12342     
+Total generated tokens (retokenized):    12769     
+Request throughput (req/s):              1.18      
+Input token throughput (tok/s):          2560.93   
+Output token throughput (tok/s):         290.31    
+Peak output token throughput (tok/s):    466.00    
+Peak concurrent requests:                20        
+Total token throughput (tok/s):          2851.24   
+Concurrency:                             13.30     
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   11312.16  
+Median E2E Latency (ms):                 10485.17  
+P90 E2E Latency (ms):                    20720.10  
+P99 E2E Latency (ms):                    23670.00  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          3578.67   
+Median TTFT (ms):                        2959.55   
+P99 TTFT (ms):                           9932.30   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          31.01     
+Median TPOT (ms):                        31.48     
+P99 TPOT (ms):                           33.22     
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           31.46     
+Median ITL (ms):                         31.85     
+P95 ITL (ms):                            33.54     
+P99 ITL (ms):                            35.78     
+Max ITL (ms):                            52.96     
+==================================================

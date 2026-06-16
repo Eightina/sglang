@@ -288,40 +288,80 @@
 
 ## 8. KV Cache 通信-计算融合优化
 
-当前 PD 模式的瓶颈在于 KV cache 传输是串行执行的：
+### 8.0 当前实现状态分析
+
+**好消息**：SGLang 已经支持 chunked prefill（默认启用）和分 chunk KV 传输。
+
+**当前实现**：
+```
+Prefill 端：
+✅ 支持 chunked prefill（默认 chunked_prefill_size = 2K/4K/8K，根据 GPU 显存自动推断）
+✅ 支持分 chunk 传输 KV cache（每个 chunk 完成后立即调用 send_kv_chunk）
+✅ 支持 page 对齐的部分传输（避免传输不完整的 page）
+✅ 支持 overlap 模式（KV 传输与 GPU forward 重叠执行）
+
+Decode 端：
+❌ 必须等待所有 KV chunk 传输完成（KVPoll.Success）才能开始 decode
+❌ 不支持在收到部分 KV 后提前开始生成
+```
+
+**瓶颈分析**：
+```
+当前流程（Prefill 端已优化，但 Decode 端仍需等待）：
+Prefill 端: [chunk 1] → [chunk 2] → [chunk 3] → ... → [chunk N]
+KV 传输:    [send 1] → [send 2] → [send 3] → ... → [send N]
+Decode 端:  [等待...] → [等待...] → [等待...] → [全部接收] → [开始 decode]
+                                                         ↑
+                                                    这里才开始工作！
+
+总时间 = prefill_time + KV_transfer_time + decode_time
+       = 2-3s         + 8-10s              + 16.9s = ~27s
+```
+
+**核心问题**：虽然 prefill 端可以边算边传，但 decode 端必须等待**最后一个 chunk** 传输完成才能开始 decode forward。这意味着对于长序列（如 input=4096），TTFT 仍然受限于整个 prefill 的完成时间加上最后一个 chunk 的传输时间。
+
+### 8.1 Prefill-Decode 流水线重叠（最高价值，P0）
+
+**核心思想**：让多个请求在 prefill 和 decode 阶段形成流水线，而不是单个请求"边收边算"。
+
+**为什么单个请求不能"边收边算"？**
+
+基于 Online Softmax / FlashAttention 的块状合并原理，理论上 decode 端可以在收到部分 KV 后就开始计算。但在实际工程中，这对 **decode 阶段**不可行：
+
+1. **时间尺度不匹配**：Decode 阶段每次只生成 1 个 token（GEMV 运算），计算时间约 50μs，而 PCIe 传输一个请求的完整 KV cache 需要 40ms。用 50μs 的计算去 overlap 40ms 的传输，覆盖率不到 0.1%，毫无意义。
+
+2. **Kernel Launch 开销**：将一次完整的大 GEMV 切碎成多次小 GEMV + 状态合并，kernel 启动开销会完全吃掉省下的计算时间，导致 GPU 利用率暴跌。
+
+3. **FlashDecoding 的本质**：把 KV 切块并行计算（FlashDecoding/SplitKV）是为了在**空间维度**（多个 SM）并行，解决 decode 阶段 Q 长度为 1 导致的 SM 利用率低问题，而不是在**时间维度**上与 PCIe 传输 overlap。
+
+**真正可行的优化：请求级流水线**
 
 ```
-当前流程（串行）：
-[prefill 全部] → [KV transfer 全部] → [decode 开始]
-时间：2-3s      + 8-10s              + 16.9s = ~27s
-```
+优化后流程（多请求流水线）：
+Request 1: [prefill] → [KV transfer] → [decode step 1] → [decode step 2] → ...
+Request 2:           [prefill] → [KV transfer] → [decode step 1] → ...
+Request 3:                     [prefill] → [KV transfer] → ...
+                    ↑ overlap ↑
+              Prefill worker 和 Decode worker 同时工作！
 
-通过通信-计算融合优化，可以显著隐藏 KV 传输开销。
-
-### 8.1 分块 Prefill + 流式 KV 传输（最高价值，P0）
-
-**核心思想**：不等 prefill 全部完成再传 KV，而是边算边传。
-
-```
-优化后流程（流水线）：
-[prefill chunk 1] → [transfer chunk 1 + prefill chunk 2] → [transfer chunk 2 + decode step 1] → ...
-时间：0.5s         + 0.5s (overlap)                        + 16.9s = ~17.5s
+时间：prefill_time + max(KV_transfer_time, decode_time × output_len)
+     = 2-3s + max(8-10s, 16.9s) = ~19-20s（而非 27s）
 ```
 
 **实现方式**：
-- 将 input 分成 N 个 chunk（如每 chunk 512 tokens）
-- Prefill 一个 chunk 后立即开始传输该 chunk 的 KV cache
-- Decode worker 收到第一个 chunk 的 KV 后就可以开始生成（使用 partial attention）
+- Prefill worker 完成一个请求的 prefill 后立即开始下一个请求的 prefill
+- Decode worker 在等待 KV transfer 时，prefill worker 已经在处理下一个请求
+- 通过 `--chunked-prefill-size` 控制 prefill chunk 大小，让 prefill 和 KV transfer 在 prefill worker 内部也能 overlap
 
 **预期收益**：
-- KV transfer 时间从 8-10s 降低到 2-3s（与 prefill 重叠）
-- TTFT 从 10.8s 降低到 4-5s
-- 吞吐提升 **20-30%**，(4096, 512) 配置下 PD/TP4 比率可达 **1.1×**（PD 反超）
+- 在高并发场景下（如 max_concurrency=32），吞吐提升 **30-50%**
+- Prefill GPU 和 Decode GPU 利用率都接近 100%
+- 对单请求 TTFT 无改善（仍需等待完整 KV transfer）
 
 **复杂度**：中等
-- 需要修改 scheduler 支持 chunked prefill
-- 需要 KV transfer 支持 streaming
-- SGLang 已有 chunked prefill 基础，扩展即可
+- SGLang 已部分支持（prefill 端的 chunked prefill + overlap 模式）
+- 需要优化 decode 端的调度，确保 decode worker 不会空闲等待
+- 需要平衡 prefill 和 decode 的工作负载
 
 ### 8.2 KV Cache 量化压缩（中等价值，P1）
 
@@ -333,9 +373,9 @@
 ```
 
 **实现方式**：
-- Prefill 端：KV cache 从 FP16 量化到 INT8（或 FP8）
-- 传输：数据量减少 2×（FP16→INT8）或 2×（FP16→FP8）
-- Decode 端：反量化回 FP16 用于 attention
+- 使用 `--kv-cache-dtype fp8_e4m3` 或 `--kv-cache-dtype fp8_e5m2` 启用 FP8 KV cache
+- Prefill 端：KV cache 使用 FP8 格式存储和传输
+- Decode 端：直接使用 FP8 KV cache 进行 attention（无需反量化）
 
 **预期收益**：
 - KV transfer 时间减少 50%
@@ -344,8 +384,9 @@
 - 可能引入轻微的精度损失（通常 <1%）
 
 **复杂度**：低
-- 标准量化技术，成熟方案
-- 可在 NIXL 传输层集成
+- SGLang 已原生支持 FP8 KV cache
+- 只需在启动时添加 `--kv-cache-dtype fp8_e4m3` 参数
+- 需要验证模型在 FP8 KV cache 下的精度
 
 ### 8.3 请求级流水线（中等价值，P1）
 
@@ -554,56 +595,50 @@ Request 2:           [prefill] → [KV transfer] → [decode]
 
 ### 11.2 中期行动（1-3 个月）
 
-**目标**：实现核心优化，PD 在大 input + 大 output 场景下达到 TP4 性能
+**目标**：实现核心优化，PD 在高并发场景下达到或超过 TP4 性能
 
-1. **实现分块 Prefill + 流式 KV 传输（P0）**
+1. **优化请求级流水线（P0）**
    ```python
-   # 伪代码示例
-   class ChunkedPrefillScheduler:
-       def process_request(self, req):
-           chunks = self.split_into_chunks(req.input_ids, chunk_size=512)
-           for i, chunk in enumerate(chunks):
-               kv_cache = self.prefill(chunk)
-               # 异步传输当前 chunk 的 KV cache
-               self.transfer_kv_async(kv_cache, decode_worker)
-               if i == 0:
-                   # 第一个 chunk 传输完成后，decode worker 可以开始生成
-                   self.signal_decode_start(req)
-   ```
-   
-   **关键设计点**：
-   - Chunk size 选择：512-1024 tokens（平衡 prefill 效率和传输延迟）
-   - Decode worker 需要支持 partial attention（只有部分 KV cache）
-   - 需要处理 chunk 传输失败的重试机制
-   
-   **预期收益**：
-   - (4096, 512) 配置下吞吐从 354 tok/s 提升到 440-460 tok/s
-   - TTFT 从 10.8s 降低到 4-5s
-
-2. **实现请求级流水线（P1）**
-   ```python
-   # Prefill worker 调度逻辑
+   # Prefill worker 调度逻辑：让多个请求形成流水线
    class PipelinedPrefillWorker:
        def run(self):
            while True:
                req = self.queue.get()
                # 异步启动 KV 传输
                transfer_future = self.transfer_kv_async(req)
-               # 同时开始下一个请求的 prefill
+               # 同时开始下一个请求的 prefill（与 KV 传输 overlap）
                next_req = self.queue.get()
                kv_cache = self.prefill(next_req)
                # 等待上一个传输完成
                transfer_future.wait()
    ```
    
+   **关键设计点**：
+   - 利用 `--chunked-prefill-size` 控制 prefill chunk 大小
+   - Prefill worker 在完成一个请求的 prefill 后立即开始下一个
+   - Decode worker 在等待 KV transfer 时，prefill worker 已经在处理下一个请求
+   
    **预期收益**：
-   - 高并发场景下吞吐提升 15-25%
-   - Prefill GPU 利用率从 60-70% 提升到 85-90%
+   - 高并发场景下（max_concurrency=32）吞吐提升 **30-50%**
+   - Prefill GPU 和 Decode GPU 利用率都接近 100%
+   - 对单请求 TTFT 无改善（仍需等待完整 KV transfer）
+
+2. **启用 FP8 KV Cache 量化（P1）**
+   ```bash
+   # 在 prefill 和 decode 的配置文件中都添加
+   --kv-cache-dtype fp8_e4m3
+   ```
+   
+   **预期收益**：
+   - KV transfer 时间减少 50%
+   - TTFT 从 10.8s 降低到 7-8s
+   - 吞吐提升 **10-15%**
+   - 需要验证模型在 FP8 KV cache 下的精度
 
 3. **优化 Decode Worker 调度**
    - 实现 KV cache 预取（prefetch）机制
    - 支持多个请求的 KV cache 并行传输
-   - 优化 attention kernel 以支持 partial KV cache
+   - 调整 `--disaggregation-decode-polling-interval` 减少轮询开销
 
 4. **建立 A/B 测试框架**
    ```python
@@ -674,9 +709,10 @@ Request 2:           [prefill] → [KV transfer] → [decode]
 - [ ] 确认 KV 传输瓶颈原因
 
 **中期（3 个月内）**：
-- [ ] 实现分块 prefill + 流式 KV 传输
-- [ ] (4096, 512) 配置下 PD 吞吐达到 440+ tok/s
-- [ ] TTFT 降低到 5s 以下
+- [ ] 优化请求级流水线（prefill 与 KV transfer overlap）
+- [ ] 启用 FP8 KV cache 量化并验证精度
+- [ ] 高并发场景下 PD 吞吐提升 30-50%
+- [ ] (4096, 512) 配置下 PD/TP4 吞吐比率达到 1.0× 以上
 
 **长期（6 个月内）**：
 - [ ] 评估并决定是否升级 NVLink 硬件

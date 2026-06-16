@@ -5,5 +5,16 @@ tensor-parallel-size: 2
 base-gpu-id: 0
 disaggregation-mode: prefill
 disaggregation-transfer-backend: nixl
+# opt 0
 enable-metrics: true
 log-requests: true
+kv-cache-dtype: fp8_e4m3
+reasoning-parser: qwen3
+tool-call-parser: qwen3_coder
+mamba-scheduler-strategy: extra_buffer
+enable-flashinfer-allreduce-fusion: true
+attention-backend: flashinfer
+# opt 1
+# optimistic_prefill_retries: 3
+# chunked-prefill-size: 4096
+# max-running-requests: 16

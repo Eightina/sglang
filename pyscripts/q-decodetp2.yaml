@@ -7,3 +7,9 @@ disaggregation-mode: decode
 disaggregation-transfer-backend: nixl
 enable-metrics: true
 log-requests: true
+kv-cache-dtype: fp8_e4m3
+reasoning-parser: qwen3
+tool-call-parser: qwen3_coder
+mamba-scheduler-strategy: extra_buffer
+enable-flashinfer-allreduce-fusion: true
+attention-backend: flashinfer

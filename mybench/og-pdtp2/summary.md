@@ -147,7 +147,7 @@ Concurrency:                             26.00
 Mean E2E Latency (ms):                   33469.84
 Median E2E Latency (ms):                 34432.01
 P90 E2E Latency (ms):                    45917.02
-P99 E2E Latency (ms):                    62005.59  
+P99 E2E Latency (ms):                    62005.59
 ---------------Time to First Token----------------
 Mean TTFT (ms):                          15638.81
 Median TTFT (ms):                        16182.65
@@ -164,4 +164,46 @@ P99 ITL (ms):                            36.98
 Max ITL (ms):                            51.94
 ==================================================
 
+```
+
+og_rag pdtp2+fp8kv+flashinfer
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 32
+Successful requests:                     100
+Benchmark duration (s):                  109.64
+Total input tokens:                      209281
+Total input text tokens:                 209281
+Total generated tokens:                  52444
+Total generated tokens (retokenized):    52517
+Request throughput (req/s):              0.91
+Input token throughput (tok/s):          1908.74
+Output token throughput (tok/s):         478.31
+Peak output token throughput (tok/s):    609.00
+Peak concurrent requests:                35
+Total token throughput (tok/s):          2387.06
+Concurrency:                             25.58
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   28046.16
+Median E2E Latency (ms):                 28538.65
+P90 E2E Latency (ms):                    39933.60
+P99 E2E Latency (ms):                    50210.77
+---------------Time to First Token----------------
+Mean TTFT (ms):                          10057.70
+Median TTFT (ms):                        9803.65
+P99 TTFT (ms):                           21168.78
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          34.29
+Median TPOT (ms):                        34.87
+P99 TPOT (ms):                           35.10
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           34.37
+Median ITL (ms):                         34.74
+P95 ITL (ms):                            36.22
+P99 ITL (ms):                            38.51
+Max ITL (ms):                            58.85
+==================================================
 ```
