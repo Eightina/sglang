@@ -361,6 +361,14 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             else model_runner.kv_cache_dtype
         )
+        # Checkpoint-provided k_scale/v_scale are FP8-KV dequant factors. They
+        # must only be applied when the KV cache is actually FP8; with a
+        # higher-precision cache (e.g. --kv-cache-dtype bf16) the stored K/V
+        # were never scaled, and applying the descale corrupts the output.
+        self.kv_cache_scales_valid = self.flashinfer_kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -929,6 +937,8 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def _kv_write_scales(self, layer: RadixAttention):
+        if not self.kv_cache_scales_valid:
+            return None, None
         if self.kv_cache_quant_method.needs_global_scale():
             return None, None
         return layer.k_scale, layer.v_scale
@@ -1367,8 +1377,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 ),
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                k_scale=layer.k_scale_float if self.kv_cache_scales_valid else None,
+                v_scale=layer.v_scale_float if self.kv_cache_scales_valid else None,
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -1429,8 +1439,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                     # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
+                    k_scale=layer.k_scale_float if self.kv_cache_scales_valid else None,
+                    v_scale=layer.v_scale_float if self.kv_cache_scales_valid else None,
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
@@ -1499,8 +1509,8 @@ class FlashInferAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            k_scale=layer.k_scale_float if self.kv_cache_scales_valid else None,
+            v_scale=layer.v_scale_float if self.kv_cache_scales_valid else None,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

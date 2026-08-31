@@ -269,6 +269,12 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        # Checkpoint-provided k_scale/v_scale are FP8-KV dequant factors; only
+        # valid when the KV cache is actually FP8 (see flashinfer_backend).
+        self.kv_cache_scales_valid = model_runner.kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         # Lean decode persistent-grid size (depends only on head architecture).
         kv_group_num = self.num_head // self.num_kv_head
@@ -1439,8 +1445,8 @@ class TritonAttnBackend(AttentionBackend):
                         loc_info,
                         k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
                         v.clone(),
-                        layer.k_scale,
-                        layer.v_scale,
+                        layer.k_scale if self.kv_cache_scales_valid else None,
+                        layer.v_scale if self.kv_cache_scales_valid else None,
                     )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
@@ -1493,7 +1499,11 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
-        if layer.k_scale is not None and layer.v_scale is not None:
+        if (
+            layer.k_scale is not None
+            and layer.v_scale is not None
+            and self.kv_cache_scales_valid
+        ):
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
         else:
@@ -1603,7 +1613,11 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices = self.forward_metadata.kv_indices
         max_extend_len = self.forward_metadata.max_extend_len
 
-        if layer.k_scale is not None and layer.v_scale is not None:
+        if (
+            layer.k_scale is not None
+            and layer.v_scale is not None
+            and self.kv_cache_scales_valid
+        ):
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
         else:
@@ -1833,7 +1847,11 @@ class TritonAttnBackend(AttentionBackend):
         # Convert prefix_lens to int32 for the kernel
         prefix_lens = prefix_lens.to(torch.int32)
 
-        if layer.k_scale is not None and layer.v_scale is not None:
+        if (
+            layer.k_scale is not None
+            and layer.v_scale is not None
+            and self.kv_cache_scales_valid
+        ):
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
         else:
@@ -1935,7 +1953,11 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
-        if layer.k_scale is not None and layer.v_scale is not None:
+        if (
+            layer.k_scale is not None
+            and layer.v_scale is not None
+            and self.kv_cache_scales_valid
+        ):
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
         else:
