@@ -83,6 +83,59 @@ def gather_kv_sequences(
 
 
 @dataclass
+class DecodeMathDiagnostics:
+    """Codec-independent fp32 decode-attention intermediates."""
+
+    k_dequant: torch.Tensor  # (q_heads, seq, dim) fp32
+    v_dequant: torch.Tensor  # (q_heads, seq, dim) fp32
+    scores: torch.Tensor  # (q_heads, seq) fp32
+    probs: torch.Tensor  # (q_heads, seq) fp32
+    output: torch.Tensor  # (q_heads, head_dim) fp32
+
+
+def torch_radix_decode_from_effective_kv(
+    q: torch.Tensor,
+    k_effective: torch.Tensor,
+    v_effective: torch.Tensor,
+    *,
+    scaling: float,
+    return_diagnostics: bool = False,
+):
+    """Run the shared decode math on already dequantized logical K/V.
+
+    ``k_effective`` and ``v_effective`` are logical sequences shaped
+    ``(seq_len, num_kv_heads, head_dim)``. This function deliberately owns all
+    codec-independent behavior shared by the FP8 L1 and MXFP4 L2 references:
+    GQA head expansion, fp32 QK, softmax, and fp32 PV.
+    """
+    q32 = q.to(torch.float32)
+    k32 = k_effective.to(torch.float32).transpose(0, 1)
+    v32 = v_effective.to(torch.float32).transpose(0, 1)
+
+    num_q_heads = q32.shape[0]
+    num_kv_heads = k32.shape[0]
+    assert num_q_heads % num_kv_heads == 0, "GQA requires q % kv == 0"
+    group = num_q_heads // num_kv_heads
+    if group > 1:
+        k32 = k32.repeat_interleave(group, dim=0)
+        v32 = v32.repeat_interleave(group, dim=0)
+
+    scores = torch.einsum("hd,hsd->hs", q32, k32) * scaling
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.einsum("hs,hsd->hd", probs, v32)
+
+    if not return_diagnostics:
+        return out
+    return out, DecodeMathDiagnostics(
+        k_dequant=k32,
+        v_dequant=v32,
+        scores=scores,
+        probs=probs,
+        output=out,
+    )
+
+
+@dataclass
 class Fp8DecodeDiagnostics:
     """Intermediate values for layered failure attribution (write/QDQ vs
     gather vs QK scale vs softmax vs V scale)."""
@@ -179,21 +232,14 @@ def torch_fp8_decode_dequant_first_reference(
     """
     seq_len = int(seq_lens)
     locs = req_to_token[int(req_pool_indices), :seq_len].long()
-    k32 = fp8_cache_dequantize_reference(k_cache[locs], k_scale).transpose(0, 1)
-    v32 = fp8_cache_dequantize_reference(v_cache[locs], v_scale).transpose(0, 1)
-    q32 = q.to(torch.float32)
-
-    num_q_heads = q32.shape[0]
-    num_kv_heads = k32.shape[0]
-    group = num_q_heads // num_kv_heads
-    assert num_q_heads % num_kv_heads == 0, "GQA requires q % kv == 0"
-    if group > 1:
-        k32 = k32.repeat_interleave(group, dim=0)
-        v32 = v32.repeat_interleave(group, dim=0)
-
-    scores = torch.einsum("hd,hsd->hs", q32, k32) * scaling
-    probs = torch.softmax(scores, dim=-1)
-    return torch.einsum("hs,hsd->hd", probs, v32)
+    k_effective = fp8_cache_dequantize_reference(k_cache[locs], k_scale)
+    v_effective = fp8_cache_dequantize_reference(v_cache[locs], v_scale)
+    return torch_radix_decode_from_effective_kv(
+        q,
+        k_effective,
+        v_effective,
+        scaling=scaling,
+    )
 
 
 # ---------------------------------------------------------------------------

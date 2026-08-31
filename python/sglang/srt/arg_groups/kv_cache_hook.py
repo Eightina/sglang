@@ -38,12 +38,31 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
-    if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
+    if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16", "mxfp4"):
         return
 
     uses_mla = use_mla_backend(server_args)
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend
+
+    if cfg.kv_cache_dtype == "mxfp4":
+        if not get_platform().is_cuda:
+            raise RuntimeError("--kv-cache-dtype=mxfp4 is currently CUDA-only.")
+        if uses_mla:
+            raise ValueError(
+                "--kv-cache-dtype=mxfp4 currently supports MHA only, not MLA."
+            )
+        if prefill_backend != "flashinfer" or decode_backend != "flashinfer":
+            raise ValueError(
+                "--kv-cache-dtype=mxfp4 currently requires FlashInfer for both "
+                f"prefill and decode, got {prefill_backend!r}/{decode_backend!r}."
+            )
+        if not cfg.disable_cuda_graph:
+            raise ValueError(
+                "--kv-cache-dtype=mxfp4 uses a validation-only BF16 PLAIN read "
+                "that allocates a full-layer temporary; pass --disable-cuda-graph."
+            )
+        return
 
     if get_platform().is_cuda:
         if cfg.kv_cache_dtype == "nvfp4" and not (
@@ -395,11 +414,12 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "Other prefill-only workloads may be supported in a future change once "
             "their attention paths stop reading or writing the paged KV cache."
         )
-    if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+    if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16", "mxfp4"):
         raise ValueError(
             "--prefill-only-disable-kv-cache does not currently support "
-            "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
-            "the FP4 pool uses a separate allocation path."
+            "--kv-cache-dtype=nvfp4, --kv-cache-dtype=fp4_mx_block16, or "
+            "--kv-cache-dtype=mxfp4 because the FP4 pool uses a separate "
+            "allocation path."
         )
     if cfg.kv_cache_dtype == "mxfp8":
         raise ValueError(

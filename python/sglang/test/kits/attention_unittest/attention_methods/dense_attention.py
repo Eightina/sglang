@@ -319,6 +319,7 @@ class MockModelRunner(ModelRunner):
         runner_batch_size: int | None = None,
         kv_cache_dtype: torch.dtype | None = None,
         kv_cache_dtype_str: str | None = None,
+        kv_cache_quant_method=None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -380,7 +381,7 @@ class MockModelRunner(ModelRunner):
             enable_deterministic_inference=False,
             enable_mis=False,
             is_embedding=False,
-            kv_cache_dtype="auto",
+            kv_cache_dtype=self.kv_cache_dtype_str,
             max_running_requests=None,
             pp_size=1,
             revision=None,
@@ -410,6 +411,7 @@ class MockModelRunner(ModelRunner):
             device=device,
             enable_memory_saver=False,
             enable_alt_stream=False,
+            quant_method=kv_cache_quant_method,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
@@ -988,6 +990,7 @@ def build_dense_attention_fixture(
     loc_layout: str = "shuffled_pages",
     kv_cache_dtype: torch.dtype | None = None,
     kv_cache_dtype_str: str | None = None,
+    kv_cache_quant_method=None,
     k_scale: float | None = None,
     v_scale: float | None = None,
     seed: int | None = None,
@@ -1017,6 +1020,7 @@ def build_dense_attention_fixture(
         runner_batch_size=runner_batch_size,
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_dtype_str=kv_cache_dtype_str,
+        kv_cache_quant_method=kv_cache_quant_method,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
