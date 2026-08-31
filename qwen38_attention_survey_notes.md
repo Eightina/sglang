@@ -473,6 +473,61 @@ scale。因此在带 checkpoint KV scales 的 Qwen3.8 上，它与 FlashInfer FP
 只有 A/B/C 均通过，才能认为 decode attention 与 Radix/page-table/FP8 scale 语义
 已经被正确复制，进入 MXFP4 阶段。
 
+#### L1 验收记录（2026-08-31 完成）
+
+新增文件：
+- `python/sglang/test/kits/attention_unittest/attention_methods/fp8_decode_attention.py`：
+  FP8 QDQ reference（`fp8_cache_quantize_reference` = clone → `div_(scale)` →
+  cast fp8）、`gather_kv_sequences`、`torch_fp8_radix_decode_reference`
+  （BMM-boundary scale placement：K descale 折入 QK^T、V descale 折入 PV 边界，
+  fp32 数学）、交叉验证变体 `torch_fp8_decode_dequant_first_reference`、
+  `decode_output_metrics`（rel_l2/cos/norm_ratio/max_abs，device-agnostic）；
+- `dense_attention.py` fixture 向后兼容扩展：`kv_cache_dtype/k_scale/v_scale/seed`
+  参数，FP8 pool `store_dtype=uint8`；scale 设置镜像生产 `kv_cache.py`：
+  0-dim f32 **CPU** `nn.Parameter` + `k_scale_float`（见发现 3）；
+- `test/registered/attention/unittests/dense/test_flashinfer_fp8_decode.py`：
+  契约 + 差分 + 表征三类测试；
+- `compare_fp8_decode.py`（仓库根目录）：真实 dump 离线回放脚本。
+
+**A. FP8 codec 单测（TestFp8KvWriteContract，6/6 通过）**，锁定四项生产语义：
+1. **slot 0 保留**：`store_cache` JIT kernel `reserved_skip_index=0` 跳过 slot 0
+   写入（CUDA-graph padding slot）；测试 loc 一律从 1 开始。
+2. **`set_kv_buffer` 原地修改调用方 cache_k/cache_v**（`div_(scale)` in place）；
+   测试需在写入前快照，否则 reference 会二次除产生 NaN/溢出。
+3. **scale 张量形态决定除法精度**：`bf16.div_(0-dim f32 CUDA tensor)` 会把
+   scale cast 到 bf16（引入舍入，实测 0.78% 字节在舍入边界翻转）；0-dim f32
+   **CPU** tensor（生产 `kv_cache.py` 的形态）与 1-dim f32 CUDA tensor 走全精度
+   标量路径。fixture 必须镜像生产的 CPU 0-dim Parameter。
+4. FP8 pool `store_dtype=uint8`：bit 级对比直接比 uint8；读侧 `_get_key_buffer`
+   才 `.view(fp8)`。
+
+**B. 单层差分（TestFlashInferFp8DecodeGolden，10/10 通过）**：
+- MHA/GQA/MQA × head_dim 64/128/256 × page 1/16/32/64 × 4 种 loc layout ×
+  scale=1/真实 checkpoint scale；
+- rel_l2 ≈ 2.2e-3~2.8e-3，cos ≥ 0.999996，norm_ratio ≈ 1.0000±2e-4；
+- 20-seed 表征（`SGLANG_FP8_DECODE_CHARACTERIZE=1`）：worst rel_l2=3.08e-3、
+  cos=0.99999523、norm_ratio 偏离 9.4e-4；冻结阈值 worst×1.25：
+  `FROZEN_REL_L2=3.9e-3`、`FROZEN_COSINE=0.9999940`、
+  `FROZEN_NORM_RATIO=(0.9988,1.0012)`；服务级硬上限
+  `rel_l2≤2e-2、cos≥0.999、norm_ratio∈[0.98,1.02]`；
+- 回归：test_torch_native + test_flashinfer 既有 54 subtests 全通过（fixture
+  扩展向后兼容）。
+
+**C. 模型端到端（离线回放替代完整服务切换，用户选定方案）**：
+- 采集：`--debug-tensor-dump-output-folder --debug-tensor-dump-layers 3` 启动
+  Qwen3.8-27B-NVFP4 + `--kv-cache-dtype fp8_e4m3`，单请求（61 prompt tokens）
+  greedy 生成 8 步，dump layer 3 的 qkv_proj/attn；
+- `compare_fp8_decode.py` 重建链路：dump qkv_proj → gemma RMSNorm → partial
+  RoPE（64 维/32 对/theta=1e7，fp32）→ bf16 → FP8 cache 写入（生产 pool 代码）
+  → torch FP8 decode reference vs dump `model.layers.3.attn`（gate 前 6144 维）；
+- 8/8 decode 步 PASS：rel_l2 3.3e-3~7.2e-3、cos 0.999974~0.999995、norm_ratio
+  0.9980~1.0003。真实数据略高于合成冻结阈值属预期（序列更长、KV 分布非均匀）；
+  两套阈值分层：单测冻结容差（同 fixture 分布）vs 服务级判定（跨数据泛化）。
+- 结论：FlashInfer FP8 decode 与 Torch FP8 decode 在真实模型数据上数值等价，
+  A/B/C 验收完成，可进入 L2（MXFP4 codec）。
+
+环境：RTX 5090 / SM120，torch 2.13.0+cu130，flashinfer 0.6.18。
+
 ### 11.5 L2：在同一 Torch decode attention 上替换为 MXFP4 codec
 
 此阶段保持 L1 的 decode gather、GQA、scaling、softmax 和输出转换完全不变，

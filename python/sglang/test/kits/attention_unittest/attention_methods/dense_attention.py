@@ -317,12 +317,16 @@ class MockModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        kv_cache_dtype: torch.dtype | None = None,
+        kv_cache_dtype_str: str | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
-        self.kv_cache_dtype = dtype
-        self.kv_cache_dtype_str = "auto"
+        self.kv_cache_dtype = (
+            kv_cache_dtype if kv_cache_dtype is not None else dtype
+        )
+        self.kv_cache_dtype_str = kv_cache_dtype_str or "auto"
         # This runner's own resolved backends (production stamps these in
         # ModelRunner.initialize); a draft runner would carry its own.
         self.prefill_attention_backend_str = case.backend
@@ -399,7 +403,7 @@ class MockModelRunner(ModelRunner):
         self.token_to_kv_pool = MHATokenToKVPool(
             size=max_token_loc + case.page_size,
             page_size=case.page_size,
-            dtype=dtype,
+            dtype=self.kv_cache_dtype,
             head_num=case.num_kv_heads,
             head_dim=head_dim,
             layer_num=1,
@@ -584,6 +588,9 @@ class DenseAttentionFixture:
     forward_batch: ForwardBatch
     prefix_hidden: list[torch.Tensor]
     input_hidden: torch.Tensor
+    # Per-tensor checkpoint KV scales (None for unquantized fixtures).
+    k_scale: float | None = None
+    v_scale: float | None = None
 
 
 def _token_loc(req_idx: int, pos: int, *, page_size: int, max_context_len: int) -> int:
@@ -927,6 +934,8 @@ def _populate_prefix_kv(
     *,
     max_context_len: int,
     loc_fn=None,
+    k_scale=None,
+    v_scale=None,
 ):
     if loc_fn is None:
 
@@ -959,6 +968,8 @@ def _populate_prefix_kv(
         loc_tensor,
         torch.cat(keys, dim=0),
         torch.cat(values, dim=0),
+        k_scale,
+        v_scale,
     )
 
 
@@ -975,8 +986,14 @@ def build_dense_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    kv_cache_dtype: torch.dtype | None = None,
+    kv_cache_dtype_str: str | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    seed: int | None = None,
 ) -> DenseAttentionFixture:
-    seed = 2026 + len(case.name) + case.num_kv_heads
+    if seed is None:
+        seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -998,6 +1015,8 @@ def build_dense_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype_str=kv_cache_dtype_str,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -1022,6 +1041,22 @@ def build_dense_attention_fixture(
         device=device,
     )
     _copy_dense_weights(actual_module, reference_module)
+    if k_scale is not None:
+        # Mirror production exactly (kv_cache.py): a 0-dim float32 CPU
+        # Parameter. The device/placement matters numerically: a 0-dim CUDA
+        # tensor takes the cast-to-bf16 broadcast path in cache_k.div_(scale),
+        # while the production CPU scalar participates at full fp32 precision.
+        actual_module.attn.k_scale = torch.nn.Parameter(
+            torch.tensor(k_scale, dtype=torch.float32), requires_grad=False
+        )
+        actual_module.attn.k_scale._skip_weight_check = True
+        actual_module.attn.k_scale_float = float(k_scale)
+    if v_scale is not None:
+        actual_module.attn.v_scale = torch.nn.Parameter(
+            torch.tensor(v_scale, dtype=torch.float32), requires_grad=False
+        )
+        actual_module.attn.v_scale._skip_weight_check = True
+        actual_module.attn.v_scale_float = float(v_scale)
     prefix_hidden = [
         torch.randn(length, hidden_size, dtype=dtype, device=device)
         for length in case.prefix_lens
@@ -1055,6 +1090,8 @@ def build_dense_attention_fixture(
         prefix_hidden,
         max_context_len=max_context_len,
         loc_fn=loc_fn,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
     return DenseAttentionFixture(
@@ -1066,6 +1103,8 @@ def build_dense_attention_fixture(
         forward_batch=forward_batch,
         prefix_hidden=prefix_hidden,
         input_hidden=input_hidden,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
 
