@@ -329,6 +329,14 @@ class TritonAttnBackend(AttentionBackend):
                 # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
                 # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
+        if self.mxfp4_native_decode:
+            # The native kernel is latency-bound at the default 8 splits:
+            # bs=1 long-context grid is only kv_heads * splits CTAs (4*8=32
+            # vs 170 SMs on SM120), and the stage-1 kernel drops from ~155us
+            # to ~67us at 4096 seq when raising splits to 32 (see
+            # scripts/playground/bench_mxfp4_decode_kernel.py). Raise the
+            # floor; an explicit larger --triton-attention-num-kv-splits wins.
+            self.max_kv_splits = max(self.max_kv_splits, 32)
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
         else:

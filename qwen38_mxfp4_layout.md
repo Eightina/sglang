@@ -56,3 +56,64 @@ decode         = triton（native mxfp4，L3 新 kernel）
   纳入范围，hook 对 speculative 组合维持拒绝。
 
 **建议的第一步不变**：先在 unittest 框架内写独立 triton dequant + decode kernel 对 L2 golden 差分（上表 #1），跑通后再动 #2-#4 的集成。scale 布局这个问题到此可以关闭：**保持现状**。
+
+## 6. L3 性能调研（2026-09-04，nsys + micro-bench + roofline）
+
+服务级 TPOT（bs≈1，RTX 5090）：
+
+| 配置 | 短文 512/128 | 长文 4096/128 |
+|---|---|---|
+| A = FP8 flashinfer | 23.7ms | 23.8ms |
+| B = mxfp4 PLAIN flashinfer | 152.7ms | 152.7ms |
+| C = mxfp4 triton native（grouped + splits32） | 24.5ms | **25.7ms** |
+| C 优化前（per-head grid + splits8） | 26.7ms | 47.5ms |
+
+### 6.1 实施的两项优化
+
+1. **grouped stage1 kernel**（`_mxfp4_grouped_decode_stage1_kernel`）：原 grid 按
+   q head 展开，同一 kv_group 的 6 个 q head 各自重读 packed K/V（读放大 6×）。
+   改为每 program 服务一个 kv head 的整个 query group，K/V 解包一次共享，
+   `tl.dot`（bf16 tile，dequant 值 bf16 无损）。重新表征冻结：单测 grouped 阈值
+   rel_l2 1.85e-3 / 集成 3.3e-3（p→bf16 + 累加顺序残差，与 stock/flashinfer 同级）。
+2. **split 并行度 8→32**（triton_backend mxfp4 分支内提升 floor，
+   `--triton-attention-num-kv-splits` 显式更大值优先）：bs=1 长文 grid 仅
+   kv_heads×splits 个 CTA（4×8=32 vs 170 SM），kernel 是 latency-bound。
+   nsys 实测：stage1 4096-seq 从 ~155µs（splits8）降至 **34.6µs**（splits32）。
+
+### 6.2 SM120 feature 调研结论（tl.dot_scaled / FP4 MMA）
+
+- triton 3.7.1 的 `tl.dot_scaled` 在 **sm_120 编译通过**，e2m1/e8m0 打包约定与
+  池布局完全一致（低 nibble = 偶数元素，scale 沿归约维每 32 元素），隔离 probe
+  中比手动解包快 34%（14.5 vs 21.9µs，QK-only）。
+- 但在**完整 decode kernel 内反而慢 2.2×**（153.7 vs 68.9µs @4096/splits32）：
+  rhs 列数小（BLOCK_H=16）、与 PV 手动 dot/softmax 混排、每次迭代 64 行小 tile，
+  FP4 MMA 的固定开销吞掉收益。且 PV 无法用 dot_scaled（V 的 scale 沿输出维而非
+  归约维，语义不匹配）。**保留为 `use_dot_scaled` 实验开关，默认关**。
+- probe 脚本：`scripts/playground/probe_dot_scaled.py`；bench 脚本：
+  `scripts/playground/bench_mxfp4_decode_kernel.py`；nsys profile：
+  `/tmp/mxfp4_kernel_profile.nsys-rep`（容器无 GPU 计数器权限，
+  `--gpu-metrics-devices` 不可用，仅 kernel 时间线）。
+
+### 6.3 roofline 与后续空间判断
+
+- 单层 kernel（4096 seq，splits32）：stage1 34.6µs + stage2 6.2µs = 41µs，
+  KV 流量 4.5MB → 110 GB/s ≈ **6% roofline**（1.79 TB/s）。kernel 仍是
+  latency/occupancy-bound，理论还有空间（更大 split、Persistent kernel、
+  stage1/2 融合、TMA descriptor 预取等）。
+- **但端到端已到收益边界**：16 层 × 41µs ≈ 656µs，仅占 TPOT 25.7ms 的
+  **~2.6%**。其余 97% 为权重读取（21.5GB/step ≈ 12ms，NVFP4/FP8 混合权重，
+  与 attention kernel 无关）、48 层 GDN 线性注意力与 o_proj/qkv_proj。
+  A（FP8 flashinfer，CUDA kernel）与 C 的剩余 1.9ms 差距中 attention 只占
+  ~0.7ms。
+- **结论：L3 decode kernel 的端到端优化到此为止**。若未来要继续压缩 TPOT，
+  方向在权重路径与 GDN 层，而非 attention kernel。PLAIN prefill 的 prefix
+  命中路径（全池 BF16 物化，TTFT 不可控）可用 roadmap §11.7 允许的
+  dequant-workspace 适配优化（独立后续项）。
+
+### 6.4 顺带发现与修复
+
+- filelock≥3.32 的 fork 审计会杀死 human_eval 的 multiprocessing 沙箱
+  （`os.fork is unsafe`）；评测驱动改为 spawn 启动方法：
+  `scripts/playground/run_humaneval_spawn.py`。
+- sgl-eval CLI 默认 n-repeats=16，greedy 下纯浪费；评测命令显式
+  `--n-repeats 1`。

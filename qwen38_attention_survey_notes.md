@@ -18,11 +18,18 @@ python -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 \
   --context-length 32768 --port 30000
 
-# experimental torch mxfp4 kvcache
+# experimental torch mxfp4 kvcache（L2：PLAIN 读，验证路径）
 /venv/main/bin/python -m sglang.launch_server \
   --model-path /sgl-workspace/models/Qwen3.8-27B-NVFP4 \
   --kv-cache-dtype mxfp4 --attention-backend flashinfer \
   --disable-cuda-graph --mem-fraction-static 0.80 \
+  --context-length 32768 --port 30001
+
+# native mxfp4 kvcache（L3：triton native decode + CUDA graph，生产组合）
+/venv/main/bin/python -m sglang.launch_server \
+  --model-path /sgl-workspace/models/Qwen3.8-27B-NVFP4 \
+  --kv-cache-dtype mxfp4 --prefill-attention-backend flashinfer \
+  --decode-attention-backend triton --mem-fraction-static 0.80 \
   --context-length 32768 --port 30001
 
 ```
@@ -571,3 +578,18 @@ Torch FP8 隔离现有量化基线；Torch MXFP4 证明新 codec；高性能 dec
 结论：`--kv-cache-dtype mxfp4` 在受限组合（flashinfer + MHA + disable-cuda-graph）
 下端到端可用，等价性达标；进入 L3 前的 oracle 链（OCP codec → Torch MXFP4
 decode → FlashInfer PLAIN）已闭环，可进入 L3。
+
+### 11.10 L3 验收记录
+
+已完成（2026-09-04），kernel 基础合入 commit `f0a95c27c1`（"triton native mxfp4
+decoding attention kernel"），位构造/grouped/splits32 优化同系列后续提交。
+完整记录（交付物、双层差分冻结阈值、融合写 kernel 契约、CUDA graph、性能
+三配置对比与优化轨迹、SM120 dot_scaled 结论、关键发现 G1-G7、复跑指南）见
+[qwen38_mxfp4_kv_acceptance_records.md](qwen38_mxfp4_kv_acceptance_records.md) §3。
+
+结论：`--kv-cache-dtype mxfp4 --prefill-attention-backend flashinfer
+--decode-attention-backend triton` + CUDA graph 端到端可用；native decode
+kernel 差分达标，融合写 kernel bit-exact；TPOT 与 FP8 基线差距 ~9%，容量
+1.52×。生产组合与后端配对决策（triton decode 只做 native、scale 布局保持
+flat、后端配对 fail-fast）另见 qwen38_mxfp4_layout.md（含 §6 性能调研）。
+精度验收（HumanEval/AIME）另行执行后补录。

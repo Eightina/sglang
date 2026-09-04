@@ -61,14 +61,16 @@ NORM_RATIO_RANGE = (0.98, 1.02)
 # Integration thresholds are characterized SEPARATELY from the standalone
 # Phase 1 ones (20 seeds, SM120 / torch 2.13.0+cu130): RadixAttention returns
 # bf16 outputs (production reality) while the oracle is fp32, so bf16 output
-# rounding dominates the residual. Measured worst cases: rel_l2 1.83e-3
-# (mqa_hd64_p16_bsz1), cosine 0.9999983 (same case), |norm_ratio - 1| 2.63e-4
-# (same case). Tighter than the L2 PLAIN frozen bound (rel_l2 3.1e-3), which
-# additionally carried the bf16 K/V materialization loss that the native
-# inline fp32 dequant avoids.
-MXFP4_TRITON_INTEG_FROZEN_REL_L2 = 2.3e-3
-MXFP4_TRITON_INTEG_FROZEN_COSINE = 0.9999978
-MXFP4_TRITON_INTEG_FROZEN_NORM_RATIO = (0.99965, 1.00035)
+# rounding dominates the residual. After the grouped-kernel optimization the
+# GQA/MQA path carries the additional p->bf16 + tl.dot residual of the stock
+# grouped semantics; the 20-seed worst cases are rel_l2 2.59e-3
+# (mqa_hd64_p16_bsz1), cosine 0.9999965 (same), |norm_ratio - 1| 7.2e-4
+# (same) -> the single bound below covers both the MHA path (1.77e-3) and
+# the grouped path. Same magnitude as the L2 PLAIN frozen bound
+# (rel_l2 3.1e-3), as expected: both are bf16-tile dot semantics.
+MXFP4_TRITON_INTEG_FROZEN_REL_L2 = 3.3e-3
+MXFP4_TRITON_INTEG_FROZEN_COSINE = 0.9999956
+MXFP4_TRITON_INTEG_FROZEN_NORM_RATIO = (0.999, 1.001)
 
 _CHARACTERIZE = os.environ.get("SGLANG_MXFP4_TRITON_INTEGRATION_CHARACTERIZE", "0") == "1"
 _CHARACTERIZE_SEEDS = 20
