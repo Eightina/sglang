@@ -81,6 +81,16 @@ class HumanEval(Eval):
 
         def find_code(completion):
             completion = completion or ""
+            # Thinking models emit their reasoning inside <think>...</think>
+            # (the opening tag may be pre-filled by the chat template and thus
+            # absent from the returned content). The signature-based
+            # extraction below keys on the first ":\n    " occurrence, which
+            # the reasoning text routinely contains, so the block must be
+            # stripped before extraction. An unclosed <think> means the
+            # response was truncated mid-reasoning: no code to salvage.
+            if "</think>" in completion:
+                completion = completion.rsplit("</think>", 1)[-1]
+            completion = completion.split("<think>")[0]
             pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
             matches = pattern.findall(completion)
             extracted_answer = matches[0] if len(matches) >= 1 else completion

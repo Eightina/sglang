@@ -64,10 +64,22 @@ NORM_RATIO_RANGE = (0.98, 1.02)
 # the native kernel dequantizes inline in fp32, so -- unlike the PLAIN path,
 # which materializes BF16 K/V -- both sides consume numerically identical
 # values (A step proves dequant exactness) and the residual is fp32
-# accumulation order only.
+# accumulation order only. MHA path only.
 MXFP4_TRITON_FROZEN_REL_L2 = 3.5e-7
 MXFP4_TRITON_FROZEN_COSINE = 0.9999997
 MXFP4_TRITON_FROZEN_NORM_RATIO = (0.9999998, 1.0000002)
+
+# Grouped path (GQA/MQA, characterized separately): the grouped kernel serves
+# the whole query group with tl.dot over bf16 tiles (stock-kernel semantics,
+# and the K/V unpack is shared across the group instead of re-read per query
+# head). The bf16 cast is lossless for dequantized E2M1 values; the residual
+# comes from p->bf16 rounding before the PV dot plus the tensor-core
+# accumulation order. 20-seed worst: rel_l2 1.45e-3 (splits1), cosine
+# 0.9999989, |norm_ratio - 1| 4.8e-4 (mqa_hd64) -- same magnitude as the
+# FlashInfer PLAIN frozen bound (2.3e-3), as expected.
+MXFP4_TRITON_GROUPED_FROZEN_REL_L2 = 1.85e-3
+MXFP4_TRITON_GROUPED_FROZEN_COSINE = 0.9999986
+MXFP4_TRITON_GROUPED_FROZEN_NORM_RATIO = (0.9994, 1.0006)
 
 _CHARACTERIZE = os.environ.get("SGLANG_MXFP4_TRITON_CHARACTERIZE", "0") == "1"
 _CHARACTERIZE_SEEDS = 20
@@ -96,20 +108,26 @@ def _assert_caps(testcase, metrics, context):
     )
 
 
-def _assert_frozen(testcase, metrics, context):
+def _assert_frozen(testcase, metrics, context, grouped=False):
+    rel_cap = MXFP4_TRITON_GROUPED_FROZEN_REL_L2 if grouped else MXFP4_TRITON_FROZEN_REL_L2
+    cos_cap = MXFP4_TRITON_GROUPED_FROZEN_COSINE if grouped else MXFP4_TRITON_FROZEN_COSINE
+    lo, hi = (
+        MXFP4_TRITON_GROUPED_FROZEN_NORM_RATIO
+        if grouped
+        else MXFP4_TRITON_FROZEN_NORM_RATIO
+    )
     testcase.assertLessEqual(
         metrics["rel_l2"],
-        MXFP4_TRITON_FROZEN_REL_L2,
-        f"[{context}] rel_l2 {metrics['rel_l2']:.3e} > frozen "
-        f"{MXFP4_TRITON_FROZEN_REL_L2} ({format_metrics(metrics)})",
+        rel_cap,
+        f"[{context}] rel_l2 {metrics['rel_l2']:.3e} > frozen {rel_cap} "
+        f"({format_metrics(metrics)})",
     )
     testcase.assertGreaterEqual(
         metrics["cosine"],
-        MXFP4_TRITON_FROZEN_COSINE,
-        f"[{context}] cosine {metrics['cosine']:.6f} < frozen "
-        f"{MXFP4_TRITON_FROZEN_COSINE} ({format_metrics(metrics)})",
+        cos_cap,
+        f"[{context}] cosine {metrics['cosine']:.6f} < frozen {cos_cap} "
+        f"({format_metrics(metrics)})",
     )
-    lo, hi = MXFP4_TRITON_FROZEN_NORM_RATIO
     testcase.assertTrue(
         lo <= metrics["norm_ratio"] <= hi,
         f"[{context}] norm_ratio {metrics['norm_ratio']:.5f} outside frozen "
@@ -346,8 +364,9 @@ def _run_decode_case(
     ref = torch.stack(refs, dim=0)
 
     metrics = decode_output_metrics(o, ref)
+    grouped = num_q_heads != num_kv_heads
     if assert_level == "frozen":
-        _assert_frozen(testcase, metrics, f"{layout}_p{page_size}_hd{head_dim}")
+        _assert_frozen(testcase, metrics, f"{layout}_p{page_size}_hd{head_dim}", grouped)
     else:
         _assert_caps(testcase, metrics, f"{layout}_p{page_size}_hd{head_dim}")
     return metrics

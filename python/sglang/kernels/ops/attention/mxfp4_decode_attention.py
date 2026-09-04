@@ -37,6 +37,7 @@ MXFP4_BLOCK_SIZE = 32
 _MXFP4_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE)
 _MIN_BLOCK_KV = 32
 _BLOCK_N = 64
+_GROUPED_BLOCK_H = 16
 
 
 @triton.jit
@@ -54,6 +55,47 @@ def _e8m0_to_f32(sbytes):
     bits = tl.where(b == 0, 0x00400000, bits)
     bits = tl.where(b == 255, 0x7FC00000, bits)
     return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _e2m1_scale_to_bf16(code, sbytes):
+    """Bit-exact E2M1 code x E8M0 scale -> bf16 via pure integer ops.
+
+    value = mag(code) * 2^(b - 127). For normal E2M1 (e >= 1) the bf16 bit
+    pattern is exp field = e + b - 1, mantissa = m << 6; the E2M1 subnormal
+    (e == 0, m == 1) is 2^(b - 128), exp field b - 1, mantissa 0; e == 0 and
+    m == 0 is a signed zero. The product crosses bf16's normal/subnormal
+    boundary when the exponent field is 0 (value 2^-127) -> subnormal
+    encoding mant = 1 << (E + 6). Out-of-range scales encode inf; an E8M0
+    NaN byte (0xFF) encodes a quiet NaN (highest priority, matching the
+    oracle's all-NaN block). Verified against the OCP oracle over all
+    16 codes x 256 scale bytes: element-exact except scale byte 0 with
+    NONZERO codes (fp32-subnormal domain where the oracle's torch.exp2
+    carries a 1-ULP error; production pairs byte 0 only with all-zero
+    codes, where both sides give exact zeros). Pure int32 ALU: no SFU exp2,
+    no fp32 multiply in the dequant hot path.
+    """
+    e = (code >> 1) & 3
+    m = (code & 1).to(tl.int32)
+    sgn = (code & 8).to(tl.int32) << 12  # sign bit 3 -> bf16 bit 15
+    b = sbytes.to(tl.int32)
+
+    is_zero = (e == 0) & (m == 0)
+    E = tl.where(e == 0, b - 1, e + b - 1)
+    mant = tl.where(e == 0, 0, m << 6)
+
+    is_sub = E < 1  # value 2^(E-127) < 2^-126: bf16 subnormal encoding
+    sub_mant = tl.where(E >= -6, 1 << tl.minimum(E + 6, 31), 0)
+    is_inf = E >= 255
+    is_nan = b == 255
+
+    normal_bits = tl.where(E > 254, 0x7F80, (E << 7) | mant)
+    bits = tl.where(is_sub, sub_mant, normal_bits)
+    bits = tl.where(is_inf, 0x7F80, bits)
+    bits = tl.where(is_zero, 0, bits)
+    bits = tl.where(is_nan, 0x7FC0, bits)
+    bits = bits | sgn
+    return (bits & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +407,405 @@ def _mxfp4_decode_stage1_kernel(
 
 
 @triton.jit
+def _mxfp4_grouped_decode_stage1_kernel(
+    Q,
+    K_Packed,
+    V_Packed,
+    K_Scales,
+    V_Scales,
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_kp_bs,
+    stride_kp_h,
+    stride_kp_page,
+    stride_kp_tok,
+    stride_vp_bs,
+    stride_vp_h,
+    stride_vp_page,
+    stride_vp_tok,
+    stride_ks_bs,
+    stride_ks_h,
+    stride_vs_bs,
+    stride_vs_h,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    q_head_num: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    PACKED_K_DIM: tl.constexpr,
+    PACKED_V_DIM: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+    NUM_V_BLOCKS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    # Grouped-head variant of ``_mxfp4_decode_stage1_kernel`` (GQA/MQA): one
+    # program owns one kv head and serves its whole query group, so the
+    # packed K/V bytes are unpacked ONCE per (token, kv_head) instead of once
+    # per query head. The per-head grid above re-reads them kv_group_num
+    # times, which dominated TPOT at long context. Math follows the stock
+    # grouped kernel: Q/K/V tiles in bf16 (EXACT for dequantized E2M1 values:
+    # 2-bit mantissa x power-of-two scale always fits bf16's 8-bit
+    # significand), tl.dot with fp32 accumulation, online softmax in fp32.
+    cur_batch = tl.program_id(0).to(tl.int64)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    heads_per_kv = tl.cdiv(kv_group_num, BLOCK_H)
+    cur_kv_head = cur_head_id // heads_per_kv
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+    byte_idx_k = offs_d // 2
+    byte_idx_v = offs_dv // 2
+    blk_idx_k = offs_d // _MXFP4_BLOCK
+    blk_idx_v = offs_dv // _MXFP4_BLOCK
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        q = tl.load(
+            Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0
+        )
+
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            tok_mask = offs_n < split_kv_end
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=tok_mask,
+                other=0,
+            )
+            if PAGE_SIZE == 1:
+                k_row = kv_loc * stride_kp_bs + cur_kv_head * stride_kp_h
+                v_row = kv_loc * stride_vp_bs + cur_kv_head * stride_vp_h
+            else:
+                page_id = kv_loc // PAGE_SIZE
+                tok_in_p = kv_loc % PAGE_SIZE
+                k_row = (
+                    page_id * stride_kp_page
+                    + tok_in_p * stride_kp_tok
+                    + cur_kv_head * stride_kp_h
+                )
+                v_row = (
+                    page_id * stride_vp_page
+                    + tok_in_p * stride_vp_tok
+                    + cur_kv_head * stride_vp_h
+                )
+            ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
+            vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
+
+            # --- K: integer bit-construct dequant straight to bf16 (no SFU
+            # exp2 / fp32 multiply; see _e2m1_scale_to_bf16), then a single
+            # bf16 dot shared by the whole query group
+            kbyte = tl.load(
+                K_Packed + k_row[:, None] + byte_idx_k[None, :],
+                mask=tok_mask[:, None] & (byte_idx_k[None, :] < PACKED_K_DIM),
+                other=0,
+            )
+            is_odd_k = (offs_d % 2) == 1
+            kcode = tl.where(is_odd_k[None, :], (kbyte >> 4) & 0x0F, kbyte & 0x0F)
+
+            ksbytes = tl.load(
+                K_Scales + ks_row[:, None] + blk_idx_k[None, :],
+                mask=tok_mask[:, None] & (blk_idx_k[None, :] < NUM_K_BLOCKS),
+                other=0,
+            )
+            k = _e2m1_scale_to_bf16(kcode, ksbytes)
+            k = tl.where(mask_d[None, :], k, 0.0)
+
+            qk = tl.dot(q, tl.trans(k))
+            qk *= sm_scale
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                qk,
+                float("-inf"),
+            )
+
+            # --- V: integer bit-construct dequant to bf16; p goes to bf16
+            # for the dot (stock semantics)
+            vbyte = tl.load(
+                V_Packed + v_row[:, None] + byte_idx_v[None, :],
+                mask=tok_mask[:, None] & (byte_idx_v[None, :] < PACKED_V_DIM),
+                other=0,
+            )
+            is_odd_v = (offs_dv % 2) == 1
+            vcode = tl.where(is_odd_v[None, :], (vbyte >> 4) & 0x0F, vbyte & 0x0F)
+
+            vsbytes = tl.load(
+                V_Scales + vs_row[:, None] + blk_idx_v[None, :],
+                mask=tok_mask[:, None] & (blk_idx_v[None, :] < NUM_V_BLOCKS),
+                other=0,
+            )
+            v = _e2m1_scale_to_bf16(vcode, vsbytes)
+            v = tl.where(mask_dv[None, :], v, 0.0)
+
+            # --- online softmax (fp32), same recurrence as the stock kernel
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv[None, :]
+        )
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+        tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
+
+
+@triton.jit
+def _mxfp4_grouped_decode_stage1_ds_kernel(
+    Q,
+    K_Packed,
+    V_Packed,
+    K_Scales,
+    V_Scales,
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_kp_bs,
+    stride_kp_h,
+    stride_kp_page,
+    stride_kp_tok,
+    stride_vp_bs,
+    stride_vp_h,
+    stride_vp_page,
+    stride_vp_tok,
+    stride_ks_bs,
+    stride_ks_h,
+    stride_vs_bs,
+    stride_vs_h,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    q_head_num: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    PACKED_K_DIM: tl.constexpr,
+    PACKED_V_DIM: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+    NUM_V_BLOCKS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    # dot_scaled variant of the grouped kernel: the QK^T product feeds the
+    # packed E2M1 bytes + E8M0 scales straight into ``tl.dot_scaled``
+    # (Blackwell block-scaled FP4 MMA on SM120), removing the manual unpack
+    # ALU chain from the hot loop. Verified against the manual path on
+    # sm_120: rel_l2 2.4e-7 vs fp32 reference, packing convention identical
+    # to the pool layout (low nibble = even element, one e8m0 byte per 32
+    # elements along the reduction dim). PV cannot use dot_scaled (V's scale
+    # sits along the OUTPUT dim, not the reduction dim), so V keeps the
+    # manual unpack + bf16 dot.
+    cur_batch = tl.program_id(0).to(tl.int64)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    heads_per_kv = tl.cdiv(kv_group_num, BLOCK_H)
+    cur_kv_head = cur_head_id // heads_per_kv
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dp = tl.arange(0, PACKED_K_DIM)
+    offs_kblk = tl.arange(0, NUM_K_BLOCKS)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+    byte_idx_v = offs_dv // 2
+    blk_idx_v = offs_dv // _MXFP4_BLOCK
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        q = tl.load(
+            Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0
+        ).to(tl.bfloat16)
+        q_t = tl.trans(q)  # (BLOCK_DMODEL, BLOCK_H) rhs layout for dot_scaled
+
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            tok_mask = offs_n < split_kv_end
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=tok_mask,
+                other=0,
+            )
+            if PAGE_SIZE == 1:
+                k_row = kv_loc * stride_kp_bs + cur_kv_head * stride_kp_h
+                v_row = kv_loc * stride_vp_bs + cur_kv_head * stride_vp_h
+            else:
+                page_id = kv_loc // PAGE_SIZE
+                tok_in_p = kv_loc % PAGE_SIZE
+                k_row = (
+                    page_id * stride_kp_page
+                    + tok_in_p * stride_kp_tok
+                    + cur_kv_head * stride_kp_h
+                )
+                v_row = (
+                    page_id * stride_vp_page
+                    + tok_in_p * stride_vp_tok
+                    + cur_kv_head * stride_vp_h
+                )
+            ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
+            vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
+
+            # --- K: packed bytes + e8m0 scales straight into FP4 MMA
+            k_packed_tile = tl.load(
+                K_Packed + k_row[:, None] + offs_dp[None, :],
+                mask=tok_mask[:, None],
+                other=0,
+            )
+            ks_tile = tl.load(
+                K_Scales + ks_row[:, None] + offs_kblk[None, :],
+                mask=tok_mask[:, None],
+                other=127,
+            )
+            qk_t = tl.dot_scaled(k_packed_tile, ks_tile, "e2m1", q_t, None, "bf16")
+            qk = tl.trans(qk_t) * sm_scale
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                qk,
+                float("-inf"),
+            )
+
+            # --- V: manual unpack (scale along the output dim: dot_scaled
+            # cannot express it), bf16 dot, fp32 accumulate
+            vbyte = tl.load(
+                V_Packed + v_row[:, None] + byte_idx_v[None, :],
+                mask=tok_mask[:, None] & (byte_idx_v[None, :] < PACKED_V_DIM),
+                other=0,
+            )
+            is_odd_v = (offs_dv % 2) == 1
+            vcode = tl.where(is_odd_v[None, :], (vbyte >> 4) & 0x0F, vbyte & 0x0F)
+            vmant = (vcode & 0x1).to(tl.float32)
+            vexp = (vcode >> 1) & 0x3
+            vnormal = tl.exp2(vexp.to(tl.float32) - 1.0) * (1.0 + 0.5 * vmant)
+            vsub = 0.5 * vmant
+            vmag = tl.where(vexp == 0, vsub, vnormal)
+            v = tl.where((vcode & 0x8) != 0, -vmag, vmag)
+            v = tl.where(mask_dv[None, :], v, 0.0)
+
+            vsbytes = tl.load(
+                V_Scales + vs_row[:, None] + blk_idx_v[None, :],
+                mask=tok_mask[:, None] & (blk_idx_v[None, :] < NUM_V_BLOCKS),
+                other=0,
+            )
+            vsf = _e8m0_to_f32(vsbytes)
+            v = (v * vsf).to(tl.bfloat16)
+
+            # --- online softmax (fp32), same recurrence as the stock kernel
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv[None, :]
+        )
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+        tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
+
+
+@triton.jit
 def _mxfp4_decode_stage2_kernel(
     Mid_O,
     Mid_O_1,
@@ -456,6 +897,9 @@ def mxfp4_decode_attention_fwd(
     attn_logits: torch.Tensor | None = None,
     attn_lse: torch.Tensor | None = None,
     num_kv_splits: torch.Tensor | None = None,
+    block_n: int = _BLOCK_N,
+    num_warps: int = 4,
+    use_dot_scaled: bool = False,
 ):
     """Native MXFP4 decode attention over packed paged KV.
 
@@ -536,51 +980,115 @@ def mxfp4_decode_attention_fwd(
     ks_slot_stride, ks_head_stride, _, _ = _extract_kv_strides(k_scales, 1)
     vs_slot_stride, vs_head_stride, _, _ = _extract_kv_strides(v_scales, 1)
 
-    grid = (batch, head_num, max_kv_splits)
-    _mxfp4_decode_stage1_kernel[grid](
-        q,
-        k_packed,
-        v_packed,
-        k_scales,
-        v_scales,
-        sm_scale,
-        kv_indptr,
-        kv_indices,
-        attn_logits,
-        attn_lse,
-        num_kv_splits,
-        q.stride(0),
-        q.stride(1),
-        kp_slot_stride,
-        kp_head_stride,
-        kp_page_stride,
-        kp_tok_stride,
-        vp_slot_stride,
-        vp_head_stride,
-        vp_page_stride,
-        vp_tok_stride,
-        ks_slot_stride,
-        ks_head_stride,
-        vs_slot_stride,
-        vs_head_stride,
-        attn_logits.stride(0),
-        attn_logits.stride(1),
-        attn_logits.stride(2),
-        kv_group_num=kv_group_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DV=BLOCK_DV,
-        PACKED_K_DIM=packed_k_dim,
-        PACKED_V_DIM=packed_v_dim,
-        NUM_K_BLOCKS=num_k_blocks,
-        NUM_V_BLOCKS=num_v_blocks,
-        BLOCK_N=_BLOCK_N,
-        MIN_BLOCK_KV=_MIN_BLOCK_KV,
-        Lk=logical_k,
-        Lv=logical_v,
-        PAGE_SIZE=page_size,
-        num_warps=4 if kv_group_num == 1 else 2,
-        num_stages=2,
-    )
+    if kv_group_num == 1:
+        # MHA: one query head per kv head -> no redundant K/V reads; the
+        # per-head kernel keeps exact element-wise fp32 math.
+        grid = (batch, head_num, max_kv_splits)
+        _mxfp4_decode_stage1_kernel[grid](
+            q,
+            k_packed,
+            v_packed,
+            k_scales,
+            v_scales,
+            sm_scale,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            q.stride(0),
+            q.stride(1),
+            kp_slot_stride,
+            kp_head_stride,
+            kp_page_stride,
+            kp_tok_stride,
+            vp_slot_stride,
+            vp_head_stride,
+            vp_page_stride,
+            vp_tok_stride,
+            ks_slot_stride,
+            ks_head_stride,
+            vs_slot_stride,
+            vs_head_stride,
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            kv_group_num=kv_group_num,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DV=BLOCK_DV,
+            PACKED_K_DIM=packed_k_dim,
+            PACKED_V_DIM=packed_v_dim,
+            NUM_K_BLOCKS=num_k_blocks,
+            NUM_V_BLOCKS=num_v_blocks,
+            BLOCK_N=block_n,
+            MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            Lk=logical_k,
+            Lv=logical_v,
+            PAGE_SIZE=page_size,
+            num_warps=num_warps,
+            num_stages=2,
+        )
+    else:
+        # GQA/MQA: grouped kernel unpacks the packed K/V once per kv head and
+        # serves the whole query group with tl.dot (see kernel docstring).
+        # use_dot_scaled=True routes QK^T through tl.dot_scaled (Blackwell
+        # FP4 MMA): 34% faster in an isolated QK-only micro-bench, but 2.2x
+        # SLOWER in the full decode loop (small rhs tile + PV dot mix), so it
+        # stays off by default; kept as an experimental knob.
+        valid_block_h = min(_GROUPED_BLOCK_H, kv_group_num)
+        head_tiles = triton.cdiv(head_num, valid_block_h)
+        grid = (batch, head_tiles, max_kv_splits)
+        stage1_kernel = (
+            _mxfp4_grouped_decode_stage1_ds_kernel
+            if use_dot_scaled
+            else _mxfp4_grouped_decode_stage1_kernel
+        )
+        stage1_kernel[grid](
+            q,
+            k_packed,
+            v_packed,
+            k_scales,
+            v_scales,
+            sm_scale,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            q.stride(0),
+            q.stride(1),
+            kp_slot_stride,
+            kp_head_stride,
+            kp_page_stride,
+            kp_tok_stride,
+            vp_slot_stride,
+            vp_head_stride,
+            vp_page_stride,
+            vp_tok_stride,
+            ks_slot_stride,
+            ks_head_stride,
+            vs_slot_stride,
+            vs_head_stride,
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            q_head_num=head_num,
+            kv_group_num=kv_group_num,
+            BLOCK_H=_GROUPED_BLOCK_H,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DV=BLOCK_DV,
+            PACKED_K_DIM=packed_k_dim,
+            PACKED_V_DIM=packed_v_dim,
+            NUM_K_BLOCKS=num_k_blocks,
+            NUM_V_BLOCKS=num_v_blocks,
+            BLOCK_N=block_n,
+            MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            Lk=logical_k,
+            Lv=logical_v,
+            PAGE_SIZE=page_size,
+            num_warps=num_warps,
+            num_stages=2,
+        )
 
     _mxfp4_decode_stage2_kernel[(batch, head_num)](
         attn_logits,
