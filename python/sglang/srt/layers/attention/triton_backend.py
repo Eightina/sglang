@@ -28,6 +28,9 @@ from sglang.srt.layers.dcp import (
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KVCacheAttentionAccessKind,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -275,6 +278,33 @@ class TritonAttnBackend(AttentionBackend):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         )
+        # L3 native MXFP4 decode: the quantized pool keeps packed E2M1 data +
+        # E8M0 scales and this backend consumes them inline through the
+        # dedicated triton kernel (no PLAIN BF16 materialization). Prefill must
+        # stay on flashinfer in production; that pairing is enforced by the
+        # server-arg hook (kv_cache_hook.py). forward_extend here would still
+        # work through the generic PLAIN BF16 read, but it is out of the
+        # validated scope.
+        self.kv_cache_quant_method = (
+            self.token_to_kv_pool.get_kv_cache_quant_method()
+        )
+        self.mxfp4_native_decode = False
+        if getattr(self.kv_cache_quant_method, "name", None) == "mxfp4":
+            decode_access = self.kv_cache_quant_method.resolve_attention_access(
+                "decode", "triton"
+            )
+            self.mxfp4_native_decode = (
+                decode_access is not None
+                and decode_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+            )
+            if not self.mxfp4_native_decode:
+                raise ValueError(
+                    "mxfp4 KV cache has no NATIVE decode access for the triton "
+                    "backend; available: "
+                    + self.kv_cache_quant_method.describe_attention_accesses(
+                        "decode"
+                    )
+                )
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         # Lean decode persistent-grid size (depends only on head architecture).
         kv_group_num = self.num_head // self.num_kv_head
@@ -1973,6 +2003,53 @@ class TritonAttnBackend(AttentionBackend):
             and layer.v_head_dim == self.swa_v_head_dim
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
+
+        # Native MXFP4 decode: read packed E2M1 + E8M0 scales straight from the
+        # pool and dequantize inline in the kernel. Narrow scope for now -- the
+        # unsupported branches fail fast instead of silently falling back.
+        if self.mxfp4_native_decode:
+            if self.dcp_size > 1:
+                raise NotImplementedError(
+                    "mxfp4 native decode does not support DCP (--dcp-size > 1)."
+                )
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                raise NotImplementedError(
+                    "mxfp4 native decode does not support sliding window attention."
+                )
+            if (
+                (logits_soft_cap or 0.0) > 0
+                or sinks is not None
+                or score_mod is not None
+                or (layer.xai_temperature_len or 0) > 0
+            ):
+                raise NotImplementedError(
+                    "mxfp4 native decode does not support logit capping, "
+                    "attention sinks, score_mod or xai temperature."
+                )
+            from sglang.kernels.ops.attention.mxfp4_decode_attention import (
+                mxfp4_decode_attention_fwd,
+            )
+
+            k_packed, v_packed, k_scales, v_scales = (
+                self.token_to_kv_pool.get_raw_kv_buffer(layer.layer_id)
+            )
+            mxfp4_decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k_packed,
+                v_packed,
+                k_scales,
+                v_scales,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                layer.scaling,
+                page_size=self.page_size,
+                max_kv_splits=self.max_kv_splits,
+                attn_logits=attn_logits,
+                attn_lse=self.forward_metadata.attn_lse,
+                num_kv_splits=self.forward_metadata.num_kv_splits,
+            )
+            return o
 
         # Resolve Work-Centric (Lean) Attention activation. In auto mode (None) the decision
         # depends on whether this forward is a CUDA-graph capture: during capture seq_lens are

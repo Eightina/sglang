@@ -766,6 +766,30 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
         k_scale=None,
         v_scale=None,
     ) -> None:
+        from sglang.kernels.ops.quantization.mxfp4_quant import (
+            mxfp4_fused_store_supported,
+            quant_store_kv_mxfp4,
+        )
+
+        if mxfp4_fused_store_supported(cache_k, cache_v, loc):
+            # L3 fused write path: one triton kernel does block amax -> E8M0
+            # scale -> E2M1 saturating RNE pack -> scatter of data + scale,
+            # preserving the reserved-slot-0 contract inside the kernel. No
+            # host sync, CUDA-graph safe. Bit-exact with the eager codec for
+            # bf16/fp16 inputs (see mxfp4_quant module docstring).
+            quant_store_kv_mxfp4(
+                cache_k,
+                cache_v,
+                loc,
+                k_buffer,
+                v_buffer,
+                k_scale_buffer,
+                v_scale_buffer,
+            )
+            return
+
+        # Eager OCP codec fallback (CPU tests, fp32/exotic dtypes,
+        # non-contiguous K/V). This remains the bit-exact reference.
         from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
 
         cache_k_fp4, cache_k_sf = MXFP4KVQuantizeUtil.batched_quantize(cache_k)
@@ -857,6 +881,7 @@ _FP4_MX_MHA_BACKENDS = frozenset(
 )
 _FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
 _MXFP4_FLASHINFER_BACKENDS = frozenset({"flashinfer"})
+_MXFP4_TRITON_DECODE_BACKENDS = frozenset({"triton"})
 
 
 def _backend_matcher(backends) -> KVCacheBackendMatcher:
@@ -930,6 +955,12 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
     MXFP4KVCacheMethod.name: (
         _plain(_PREFILL, _MXFP4_FLASHINFER_BACKENDS, _MXFP4_SCALE, _BF16),
         _plain(_DECODE, _MXFP4_FLASHINFER_BACKENDS, _MXFP4_SCALE, _BF16),
+        # L3 native decode: the triton kernel in
+        # sglang/kernels/ops/attention/mxfp4_decode_attention.py reads the
+        # packed E2M1 data + E8M0 scales inline (no PLAIN materialization).
+        _native_fp4(
+            _DECODE, _MXFP4_TRITON_DECODE_BACKENDS, _MXFP4_SCALE, _TORCH_FP4
+        ),
     ),
 }
 

@@ -321,7 +321,14 @@ class TestMXFP4KVCacheMethod(CustomTestCase):
             method.resolve_attention_access("decode", "flashinfer").kind,
             KVCacheAttentionAccessKind.PLAIN,
         )
-        self.assertIsNone(method.resolve_attention_access("decode", "triton"))
+        # L3: native decode for the triton backend (kernel reads packed E2M1 +
+        # E8M0 scales inline); triton prefill stays unsupported (PLAIN reads
+        # are flashinfer-only).
+        self.assertEqual(
+            method.resolve_attention_access("decode", "triton").kind,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        )
+        self.assertIsNone(method.resolve_attention_access("prefill", "triton"))
         # 16 layers: 16 KiB packed + 1 KiB E8M0 scales + 4 KiB
         # one-layer BF16 PLAIN scratch reserve.
         self.assertEqual(method.compute_cell_size(4, 256, 16, 1), 21 * 1024)

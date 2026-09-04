@@ -52,15 +52,27 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "--kv-cache-dtype=mxfp4 currently supports MHA only, not MLA."
             )
-        if prefill_backend != "flashinfer" or decode_backend != "flashinfer":
+        # Prefill/extend always runs on FlashInfer (BF16 PLAIN read, validated
+        # at L2). Decode may stay on FlashInfer (PLAIN, validation path) or use
+        # triton (native MXFP4 kernel reading packed data + scales inline).
+        allowed_backend_pairs = (("flashinfer", "flashinfer"), ("flashinfer", "triton"))
+        if (prefill_backend, decode_backend) not in allowed_backend_pairs:
             raise ValueError(
-                "--kv-cache-dtype=mxfp4 currently requires FlashInfer for both "
-                f"prefill and decode, got {prefill_backend!r}/{decode_backend!r}."
+                "--kv-cache-dtype=mxfp4 requires prefill=flashinfer with decode "
+                "flashinfer (BF16 PLAIN read) or triton (native MXFP4 kernel), "
+                f"got {prefill_backend!r}/{decode_backend!r}."
             )
-        if not cfg.disable_cuda_graph:
+        # CUDA graph capture is graph-safe only with the native triton decode
+        # (fused write kernel + native decode kernel, no host sync, verified by
+        # capture/replay tests). The flashinfer PLAIN decode materializes a
+        # full-layer BF16 temporary per step and stays validation-only.
+        if decode_backend == "flashinfer" and not cfg.disable_cuda_graph:
             raise ValueError(
-                "--kv-cache-dtype=mxfp4 uses a validation-only BF16 PLAIN read "
-                "that allocates a full-layer temporary; pass --disable-cuda-graph."
+                "--kv-cache-dtype=mxfp4 with the flashinfer PLAIN decode path "
+                "requires --disable-cuda-graph (it materializes a full-layer "
+                "BF16 temporary per decode step); use "
+                "--decode-attention-backend triton (native kernel, "
+                "graph-safe) to run with CUDA graphs."
             )
         return
 

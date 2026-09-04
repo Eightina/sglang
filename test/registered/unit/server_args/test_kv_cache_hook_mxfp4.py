@@ -44,14 +44,64 @@ class TestMxfp4KvCacheHook(CustomTestCase):
         with _patched_platform(), _patched_mla():
             handle_kv4_compatibility(_mxfp4_args())
 
-    def test_rejects_non_flashinfer_backend(self):
+    def test_accepts_flashinfer_prefill_triton_decode(self):
+        # L3 production pairing: flashinfer PLAIN prefill + native triton decode.
         from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
 
         with _patched_platform(), _patched_mla():
-            with self.assertRaisesRegex(ValueError, "FlashInfer"):
+            handle_kv4_compatibility(
+                _mxfp4_args(
+                    attention_backend=None,
+                    prefill_attention_backend="flashinfer",
+                    decode_attention_backend="triton",
+                )
+            )
+
+    def test_rejects_whole_triton_backend(self):
+        from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
+
+        with _patched_platform(), _patched_mla():
+            with self.assertRaisesRegex(ValueError, "prefill=flashinfer"):
                 handle_kv4_compatibility(_mxfp4_args(attention_backend="triton"))
 
-    def test_rejects_cuda_graph_enabled(self):
+    def test_rejects_triton_prefill_with_flashinfer_decode(self):
+        # mxfp4 prefill must stay on the flashinfer PLAIN read path.
+        from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
+
+        with _patched_platform(), _patched_mla():
+            with self.assertRaisesRegex(ValueError, "prefill=flashinfer"):
+                handle_kv4_compatibility(
+                    _mxfp4_args(prefill_attention_backend="triton")
+                )
+
+    def test_rejects_unsupported_decode_backend(self):
+        from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
+
+        with _patched_platform(), _patched_mla():
+            with self.assertRaisesRegex(ValueError, "prefill=flashinfer"):
+                handle_kv4_compatibility(
+                    _mxfp4_args(decode_attention_backend="torch_native")
+                )
+
+    def test_accepts_cuda_graph_enabled_with_triton_decode(self):
+        # L3: the native triton decode (fused write kernel + native decode
+        # kernel, no host sync) is capture/replay verified, so CUDA graphs are
+        # allowed for the (flashinfer, triton) pairing.
+        from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
+
+        with _patched_platform(), _patched_mla():
+            handle_kv4_compatibility(
+                _mxfp4_args(
+                    disable_cuda_graph=False,
+                    attention_backend=None,
+                    prefill_attention_backend="flashinfer",
+                    decode_attention_backend="triton",
+                )
+            )
+
+    def test_rejects_cuda_graph_enabled_with_plain_decode(self):
+        # The flashinfer PLAIN decode materializes a full-layer BF16 temporary
+        # per step and stays validation-only (no capture).
         from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
 
         with _patched_platform(), _patched_mla():
