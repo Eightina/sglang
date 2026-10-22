@@ -14,6 +14,9 @@
 #   - sgl-kernel wheel 与 torch 主版本 ABI 硬绑定，错配 import 报 undefined symbol
 #   - flashinfer 三件套 (python / jit-cache+cu130 / cubin) 版本必须完全一致
 #   - sgl-kernel 0.4.x 不在 PyPI，wheel 来自 github sgl-project/whl releases
+#   - compressed-tensors / sglang 本体不在上面任何一步里，需单独装：
+#       compressed-tensors 走 python/pyproject.toml 的 pin（0.18.0）
+#       sglang 必须 editable 装本仓库，否则 KV descale 修复不生效
 # ============================================================================
 set -euo pipefail
 
@@ -25,7 +28,12 @@ SGL_KERNEL_CU="130"                    # wheel 的 cu 索引（cu130）
 FLASHINFER_VERSION="0.6.18"
 FLASHINFER_JIT_CACHE="${FLASHINFER_VERSION}+cu130"
 TRANSFORMERS_VERSION="5.12.1"
+COMPRESSED_TENSORS_VERSION="0.18.0"   # 与 python/pyproject.toml 的 pin 保持一致
 # -----------------------------------------------------------------------------
+
+# 本脚本所在目录 = 仓库根；sglang 包目录用于 editable 安装 + 验证路径比对
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SGLANG_PKG_DIR="${SGLANG_PKG_DIR:-${REPO_ROOT}/python}"
 
 PYTORCH_INDEX="https://download.pytorch.org/whl/cu130"
 FI_JIT_INDEX="https://flashinfer.ai/whl/cu130/"
@@ -109,19 +117,45 @@ if [[ "$CHECK_ONLY" -eq 0 ]]; then
         --extra-index-url "$FI_CUBIN_INDEX"
 fi
 
-# ---------------------------- 4. transformers --------------------------------
+# ---------------------- 4. transformers / compressed-tensors ------------------
 if [[ "$CHECK_ONLY" -eq 0 ]]; then
     ensure "transformers" "$TRANSFORMERS_VERSION" \
         "transformers==$TRANSFORMERS_VERSION"
+    ensure "compressed-tensors" "$COMPRESSED_TENSORS_VERSION" \
+        "compressed-tensors==$COMPRESSED_TENSORS_VERSION"
 fi
 # torchaudio/torchcodec 按仓库 pyproject pin 保持不动（torchaudio==2.11.0 与 torch 2.13 共存）
 
-# ------------------------------- 5. 验证 -------------------------------------
+# --------------------------- 5. sglang（editable） ----------------------------
+# 必须是本仓库 editable 安装：否则 import 到的是别处的 sglang，KV descale 修复不在。
+# SGLANG_BUILD_RUST_EXTS=none 跳过编译期 Rust 扩展；运行时由
+# sglang.srt.rust_extensions.loader 按需 cargo build（基线启动不需要这些扩展）。
+sglang_from_repo() {
+    "$PY" - "$SGLANG_PKG_DIR" <<'PYEOF'
+import sys
+try:
+    import sglang
+except Exception:
+    sys.exit(1)
+sys.exit(0 if sys.argv[1] in sglang.__file__ else 1)
+PYEOF
+}
+
+if [[ "$CHECK_ONLY" -eq 0 ]] && ! sglang_from_repo; then
+    log "[install] sglang: editable <- $SGLANG_PKG_DIR"
+    SGLANG_BUILD_RUST_EXTS=none "$PY" -m pip install -e "$SGLANG_PKG_DIR" \
+        || die "sglang editable 安装失败"
+elif [[ "$CHECK_ONLY" -eq 0 ]]; then
+    log "[skip] sglang: 本仓库 editable 已满足"
+fi
+
+# ------------------------------- 6. 验证 -------------------------------------
 log "开始验证..."
 if ! E_TORCH="$TORCH_VERSION" E_TV="$TORCHVISION_VERSION" \
 E_SGLK="$SGL_KERNEL_EXPECTED" E_FI="$FLASHINFER_VERSION" \
 E_JIT="$FLASHINFER_JIT_CACHE" E_CUBIN="$FLASHINFER_VERSION" \
-E_TR="$TRANSFORMERS_VERSION" \
+E_TR="$TRANSFORMERS_VERSION" E_CT="$COMPRESSED_TENSORS_VERSION" \
+E_SGL_SRC="$SGLANG_PKG_DIR" \
 "$PY" - <<'PYEOF'
 import importlib.metadata as im
 import os, sys
@@ -159,16 +193,20 @@ row("flashinfer-cubin",    "flashinfer-cubin",    os.environ["E_CUBIN"])
 
 print("[4/4] transformers / compressed-tensors / sglang")
 row("transformers", "transformers", os.environ["E_TR"], "transformers")
+row("compressed-tensors", "compressed-tensors", os.environ["E_CT"],
+    "compressed_tensors")
 try:
-    import compressed_tensors
-    print(f"  [PASS] compressed-tensors: {im.version('compressed-tensors')}")
+    import sglang
+    print(f"  [PASS] sglang: {sglang.__version__}")
+    print(f"        -> {sglang.__file__}")
+    if os.environ["E_SGL_SRC"] not in sglang.__file__:
+        print(f"  [WARN] sglang 非本仓库 editable 安装（期望在 "
+              f"{os.environ['E_SGL_SRC']} 下），KV descale 修复可能不在！")
 except Exception as e:
     ok = False
-    print(f"  [FAIL] compressed-tensors: <ERROR: {e}>")
-import sglang
-print(f"        sglang {sglang.__version__} @ {sglang.__file__}")
-if "/sgl-workspace/sglang/python" not in sglang.__file__:
-    print("  [WARN] sglang 非本仓库 editable 安装，KV descale 修复可能不在！")
+    print(f"  [FAIL] sglang: <ERROR: {type(e).__name__}: {e}>\n"
+          f"         （修复: SGLANG_BUILD_RUST_EXTS=none pip install -e "
+          f"{os.environ['E_SGL_SRC']}）")
 
 sys.exit(0 if ok else 1)
 PYEOF
