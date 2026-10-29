@@ -1,0 +1,3 @@
+[submodule ".kernel-design-agents"]
+	path = .kernel-design-agents
+	url = https://github.com/Eightina/kernel-design-agents.git
