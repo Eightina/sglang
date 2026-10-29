@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Cold-L2 kernel comparison: flashinfer FP8 KV decode vs MXFP4 stage1+stage2.
+
+The only FP8 attention number on record (0.130 ms/layer/step) came from a
+server trace, i.e. real/warm conditions and a different context length, so it
+cannot be put next to the cold-L2 microbenchmarks in section 4 of the doc.
+This runs both paths through the identical harness: same shapes, same bs=1,
+page_size=1, L2 evicted before every timed launch, CUDA events around the
+launch only.
+
+Per token per layer the two codecs move different amounts:
+    FP8    2 * kv_heads * head_dim * 1 B            = 2048 B
+    MXFP4  2 * kv_heads * (head_dim/2 + head_dim/32) = 1088 B
+so MXFP4 has a 1.88x traffic advantage and the interesting question is how
+much of it survives as wall time.
+
+    python .bench_fp8_attention.py [seq_len ...]
+"""
+import sys
+
+import torch
+import triton
+
+from sglang.kernels.ops.attention import decode_attention_mxfp4_sm120 as mod
+from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+Q_HEADS, KV_HEADS, HEAD_DIM = 24, 4, 256
+BATCH, PAGE_SIZE = 1, 1
+DEV = "cuda"
+ITERS = 50
+PEAK_READ_GBPS = 1686.6
+SM_SCALE = 1.0 / (HEAD_DIM**0.5)
+
+
+def cold_time(run, thrash, iters=ITERS):
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    pairs = []
+    for i in range(iters):
+        thrash.fill_(i & 0xFF)
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        run()
+        e.record()
+        pairs.append((s, e))
+    torch.cuda.synchronize()
+    return sum(s.elapsed_time(e) for s, e in pairs) / iters
+
+
+def main():
+    seq_lens = [int(a) for a in sys.argv[1:]] or [32768, 100000, 150000]
+    max_slots = max(seq_lens) + 16
+    gen = torch.Generator(device=DEV).manual_seed(1234)
+    ref = torch.randn(
+        (max_slots, KV_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEV,
+        generator=gen,
+    )
+    # Independent K and V, so neither path gets V reads for free out of the L2
+    # lines its K reads already pulled in.
+    ref_v = torch.randn(
+        (max_slots, KV_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEV,
+        generator=gen,
+    )
+    kp, ks = MXFP4KVQuantizeUtil.batched_quantize(ref)
+    vp, vs = MXFP4KVQuantizeUtil.batched_quantize(ref_v)
+    k_fp8 = ref.to(torch.float8_e4m3fn)
+    v_fp8 = ref_v.to(torch.float8_e4m3fn)
+    del ref, ref_v
+    torch.cuda.empty_cache()
+
+    q = torch.randn(
+        (BATCH, Q_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEV,
+        generator=torch.Generator(device=DEV).manual_seed(7),
+    )
+    thrash = torch.empty(192 * 2**20, dtype=torch.uint8, device=DEV)
+
+    import flashinfer
+
+    workspace = torch.empty(384 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+
+    nblk = HEAD_DIM // mod.MXFP4_BLOCK_SIZE
+    num_warps, ctas_per_sm = mod.stage1_launch_config(Q_HEADS // KV_HEADS, 0)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    valid_h = min(mod._GROUPED_BLOCK_H, Q_HEADS // KV_HEADS)
+    head_tiles = triton.cdiv(Q_HEADS, valid_h)
+    max_splits = max(1, ctas_per_sm * sms // head_tiles)
+
+    fp8_bytes_per_tok = 2 * KV_HEADS * HEAD_DIM
+    mx_bytes_per_tok = 2 * KV_HEADS * (HEAD_DIM // 2 + nblk)
+    print(f"flashinfer {flashinfer.__version__}  peak_read={PEAK_READ_GBPS:.0f} GB/s")
+    print(f"per token/layer: FP8 {fp8_bytes_per_tok} B | MXFP4 "
+          f"{mx_bytes_per_tok} B ({fp8_bytes_per_tok / mx_bytes_per_tok:.2f}x)")
+
+    print(f"\n{'seq':>8} | {'FP8 ms':>8} {'MiB':>7} {'GB/s':>6} {'MBU':>6} | "
+          f"{'MXFP4 ms':>9} {'s1':>7} {'s2':>7} {'MiB':>7} {'GB/s':>6} {'MBU':>6} | "
+          f"{'MXFP4 vs FP8':>13}")
+    for seq_len in seq_lens:
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=DEV)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=DEV)
+        last_page = torch.ones(BATCH, dtype=torch.int32, device=DEV)
+
+        wrapper.begin_forward(
+            kv_indptr, kv_indices, last_page,
+            Q_HEADS, KV_HEADS, HEAD_DIM, PAGE_SIZE,
+            data_type=torch.float8_e4m3fn, q_data_type=torch.bfloat16,
+            non_blocking=False,
+        )
+        qf = q.view(-1, Q_HEADS, HEAD_DIM).contiguous()
+
+        def run_fp8():
+            wrapper.forward(qf, (k_fp8, v_fp8), sm_scale=SM_SCALE,
+                            k_scale=1.0, v_scale=1.0)
+
+        t_fp8 = cold_time(run_fp8, thrash)
+
+        o = torch.empty((BATCH, Q_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEV)
+        splits = max(1, min(max_splits, triton.cdiv(seq_len, mod._MIN_BLOCK_KV)))
+        num_kv_splits = torch.tensor([splits], dtype=torch.int32, device=DEV)
+        attn_logits = torch.empty(
+            (BATCH, Q_HEADS, max_splits, HEAD_DIM), dtype=torch.float32, device=DEV
+        )
+        attn_lse = torch.empty(
+            (BATCH, Q_HEADS, max_splits), dtype=torch.float32, device=DEV
+        )
+
+        def run_mx():
+            mod.mxfp4_decode_attention_fwd(
+                q, kp, vp, ks, vs, o, kv_indptr, kv_indices, SM_SCALE,
+                page_size=PAGE_SIZE, max_kv_splits=max_splits,
+                attn_logits=attn_logits, attn_lse=attn_lse,
+                num_kv_splits=num_kv_splits, num_warps=num_warps,
+            )
+
+        t_mx = cold_time(run_mx, thrash)
+
+        from torch.profiler import ProfilerActivity, profile
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for i in range(20):
+                thrash.fill_(i & 0xFF)
+                run_mx()
+            torch.cuda.synchronize()
+        t1 = t2 = 0.0
+        for ev in prof.key_averages():
+            if "stage1" in ev.key:
+                t1 += ev.self_device_time_total / 20 / 1e3
+            elif "stage2" in ev.key:
+                t2 += ev.self_device_time_total / 20 / 1e3
+
+        fp8_b = seq_len * fp8_bytes_per_tok
+        # MXFP4 also streams kv_indices once per head tile and round-trips the
+        # fp32 split partials through stage 2.
+        mx_b = (
+            seq_len * mx_bytes_per_tok
+            + head_tiles * seq_len * 4
+            + 2 * BATCH * Q_HEADS * splits * (HEAD_DIM + 1) * 4
+        )
+        f_gbps = fp8_b / (t_fp8 / 1e3) / 1e9
+        m_gbps = mx_b / (t_mx / 1e3) / 1e9
+        print(f"{seq_len:>8} | {t_fp8:>8.4f} {fp8_b / 2**20:>7.1f} {f_gbps:>6.0f} "
+              f"{f_gbps / PEAK_READ_GBPS * 100:>5.1f}% | "
+              f"{t_mx:>9.4f} {t1:>7.4f} {t2:>7.4f} {mx_b / 2**20:>7.1f} "
+              f"{m_gbps:>6.0f} {m_gbps / PEAK_READ_GBPS * 100:>5.1f}% | "
+              f"{t_mx / t_fp8 - 1:>+12.1%}")
+
+
+if __name__ == "__main__":
+    main()
