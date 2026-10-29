@@ -33,6 +33,8 @@ MXFP4_BLOCK_SIZE = 32
 # bytes, used by the nibble-interleaved loads.
 _MXFP4_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE)
 _MXFP4_HALF_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE // 2)
+# Same value outside triton's constexpr wrapper, for launch-time tile sizing.
+_HALF_BLOCK = MXFP4_BLOCK_SIZE // 2
 _MIN_BLOCK_KV = 32
 _BLOCK_N = 64
 _GROUPED_BLOCK_H = 16
@@ -44,12 +46,14 @@ _GROUPED_BLOCK_H = 16
 # updating these would silently desync that schedule.
 #
 # Measured on SM120 / triton 3.7.1 (24Q/4KV, head_dim 256, BLOCK_N 64):
-#   grouped, nibble-interleaved : 4 warps, 178 regs, 0 spills, 43,008 B smem
+#   grouped, nibble-interleaved : 4 warps, 211 regs, 0 spills, 43,008 B smem
 #   per-head (MHA, fp32 LUT)    : 8 warps, 255 regs, 16 spills, 43,008 B smem
 # The grouped path needs only half the threads of the per-head one and stays
-# well under the 255-register ISA ceiling, so two of its CTAs fit per SM.
+# under the 255-register ISA ceiling, so two of its CTAs fit per SM. Both
+# limits are close: 211 regs x 128 threads = 27,008 of 65,536, and 43,008 B of
+# shared memory is 84% of the 51,200 B that a second resident CTA allows.
 _GROUPED_NUM_WARPS = 4
-_GROUPED_REGS_PER_THREAD = 178
+_GROUPED_REGS_PER_THREAD = 211
 _PERHEAD_NUM_WARPS = 8
 _PERHEAD_REGS_PER_THREAD = 255
 _STAGE1_SMEM_BYTES = 43008
@@ -143,6 +147,116 @@ def _e2m1_scale_to_bf16(code, sbytes):
 # one 32 B sector (bf16), i.e. blocks read one sector per gather.
 _LUT_SIZE = 1 << 12
 _LUT_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+# ---------------------------------------------------------------------------
+# Hardware E2M1 decode (grouped path)
+# ---------------------------------------------------------------------------
+# SM120's tensor pipe has a native packed-FP4 converter: one
+# ``F2FP.F16.E2M1.UNPACK_B`` turns a packed byte into both nibbles as f16x2.
+# That removes the LUT gather from the hot loop, which the memory twin priced
+# at +0.0425 ms of stage 1's 0.1256 ms at 100k -- 34% of the kernel -- against
+# +0.0012 ms for this path (see .roofline_mxfp4_decode.py MODE 4).
+#
+# Two details cost real time to find:
+#   * the source operand must be a ``.b8`` register. Handing it ``.b16`` makes
+#     ptxas say "Arguments mismatch", which is a syntax error, not an
+#     unsupported-instruction error.
+#   * ptxas only accepts the instruction for the arch-specific targets
+#     (sm_120a / sm_100a), not plain sm_120.
+# Same instruction flashinfer's XQA uses in ``convertKCacheWordToF16``
+# (csrc/xqa/utils.cuh), gated there on ``__CUDA_ARCH__ >= 1000``.
+
+
+# One nibble per call, not both, even though the instruction always produces
+# both. A [BLOCK_N, 128] bf16 tile that feeds a ``tl.dot`` costs 16 KB of shared
+# memory, and stage 1 only has 8 KB of headroom before it drops from 2 resident
+# CTAs per SM to 1 (see ``_STAGE1_SMEM_BYTES``). Returning the pair forces both
+# halves live from the same point, so both tiles are staged at once; splitting
+# the convert lets the first half die into its dot before the second exists.
+# The duplicated F2FP is free -- the memory twin could not measure the convert
+# at all (MODE 5 came out at -0.0029 ms, i.e. inside the noise).
+
+
+@triton.jit
+def _cvt_e2m1_lo(byte):
+    """Packed-FP4 byte -> low nibble as f16."""
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 b0; .reg .b32 t;"
+        "  mov.b32 {b0, _, _, _}, $1;"
+        "  cvt.rn.f16x2.e2m1x2 t, b0;"
+        "  mov.b32 {$0, _}, t; }",
+        "=h,r",
+        [byte.to(tl.int32)],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _cvt_e2m1_hi(byte):
+    """Packed-FP4 byte -> high nibble as f16."""
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 b0; .reg .b32 t;"
+        "  mov.b32 {b0, _, _, _}, $1;"
+        "  cvt.rn.f16x2.e2m1x2 t, b0;"
+        "  mov.b32 {_, $0}, t; }",
+        "=h,r",
+        [byte.to(tl.int32)],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _e8m0_to_bf16(sbytes):
+    """E8M0 scale byte -> bf16 ``2^(b - 127)``, matching ``_e2m1_scale_to_bf16``.
+
+    The exponent field of a bf16 is exactly ``b``, so the common case is a
+    shift. The two ends are not: ``b == 0`` means 2^-127, which is below bf16's
+    smallest normal and has to be written as the subnormal with significand
+    2^6; ``b == 255`` is the E8M0 NaN byte and must stay NaN so it poisons the
+    whole block the way the table's highest-priority NaN row does. Both are
+    selects on the scale tile, which is 1/16th the size of the code tile.
+    """
+    b = sbytes.to(tl.int32)
+    bits = tl.where(b == 0, 0x0040, b << 7)
+    bits = tl.where(b == 255, 0x7FC0, bits)
+    return (bits & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
+def _broadcast_scale(
+    sbytes, BLOCK_N: tl.constexpr, NUM_BLK: tl.constexpr, WIDTH: tl.constexpr
+):
+    """``[BLOCK_N, NUM_BLK]`` E8M0 bytes -> ``[BLOCK_N, WIDTH]`` bf16 scales.
+
+    Each scale byte covers ``WIDTH // NUM_BLK`` consecutive packed bytes, and a
+    row-major reshape of ``[BLOCK_N, NUM_BLK, span]`` puts element j in block
+    ``j // span`` -- the same mapping the per-element gather had.
+
+    Converting to bf16 before the fan-out rather than after keeps the select
+    chain on the narrow tile: 1/16th the elements for identical results.
+    """
+    span: tl.constexpr = WIDTH // NUM_BLK
+    scale = _e8m0_to_bf16(sbytes)
+    return tl.reshape(
+        tl.broadcast_to(scale[:, :, None], (BLOCK_N, NUM_BLK, span)),
+        (BLOCK_N, WIDTH),
+    )
+
+
+# Why the product is exact rather than merely close: an E2M1 magnitude needs at
+# most 3 significand bits, so f16 -> bf16 loses nothing, and an E8M0 scale is a
+# power of two, so the bf16 product is exact except where it leaves bf16's range
+# -- and there inf and the subnormals are what the table holds too. Verified
+# over all 4096 (scale byte, code) pairs by .verify_hw_cvt_exact.py.
+#
+# Everything stays 16-bit on purpose: routing through fp32 first costs no extra
+# math but widens the same dot operands, which is exactly the budget that is
+# tight here.
 
 
 @triton.jit
@@ -393,6 +507,8 @@ def _mxfp4_grouped_decode_stage1_kernel(
     PACKED_V_DIM: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
     NUM_V_BLOCKS: tl.constexpr,
+    SCALE_TILE_K: tl.constexpr,
+    SCALE_TILE_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     Lk: tl.constexpr,
@@ -447,8 +563,15 @@ def _mxfp4_grouped_decode_stage1_kernel(
     mask_v_hi = offs_v_hi < Lv
     byte_mask_k = offs_half < PACKED_K_DIM
     byte_mask_v = offs_halfv < PACKED_V_DIM
-    blk_idx_k = offs_half // _MXFP4_HALF_BLOCK
-    blk_idx_v = offs_halfv // _MXFP4_HALF_BLOCK
+    # Scales are read at their natural width -- one byte per 16 packed bytes --
+    # and fanned out in registers. Indexing them with ``offs_half // 16`` instead
+    # builds a [BLOCK_N, HALF_D] pointer tile to fetch 512 B of distinct data;
+    # ptxas dedupes that to 8 scalar ``LDG.E.U8`` per thread, but those 8
+    # scattered L1 transactions cost as many memory instructions as the entire
+    # packed stream (16 async 128-bit copies) for 6% of the bytes -- 36% of
+    # stage 1 (see section 5.6 of the profiling log).
+    offs_sblk_k = tl.arange(0, SCALE_TILE_K)
+    offs_sblk_v = tl.arange(0, SCALE_TILE_V)
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
@@ -504,27 +627,29 @@ def _mxfp4_grouped_decode_stage1_kernel(
             ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
             vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
 
-            # --- K: one byte load + one scale load feed two LUT gathers (see
-            # e2m1_scale_lut); the group shares the resulting bf16 tiles.
+            # --- K: one byte load + one scale load feed the hardware E2M1
+            # converter; the group shares the resulting bf16 tiles. The halves
+            # are interleaved with their dots so only one is ever staged.
             kbyte = tl.load(
                 K_Packed + k_row[:, None] + offs_half[None, :],
                 mask=tok_mask[:, None] & byte_mask_k[None, :],
                 other=0,
             )
             ksbytes = tl.load(
-                K_Scales + ks_row[:, None] + blk_idx_k[None, :],
-                mask=tok_mask[:, None] & (blk_idx_k[None, :] < NUM_K_BLOCKS),
+                K_Scales + ks_row[:, None] + offs_sblk_k[None, :],
+                mask=tok_mask[:, None] & (offs_sblk_k[None, :] < NUM_K_BLOCKS),
                 other=0,
             )
-            k_scale_base = ksbytes.to(tl.int32) << 4
-            k_lo = tl.load(E2M1_LUT + (k_scale_base | (kbyte & 0x0F)))
-            k_hi = tl.load(E2M1_LUT + (k_scale_base | ((kbyte >> 4) & 0x0F)))
-            k_lo = tl.where(mask_k_lo[None, :], k_lo, 0.0)
-            k_hi = tl.where(mask_k_hi[None, :], k_hi, 0.0)
+            k_scale = _broadcast_scale(ksbytes, BLOCK_N, SCALE_TILE_K, HALF_D)
 
             # The two halves are disjoint slices of the same contraction, so
-            # their partial dots simply add.
-            qk = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))
+            # their partial dots simply add -- here by chaining the accumulator.
+            k_lo = _cvt_e2m1_lo(kbyte).to(tl.bfloat16) * k_scale
+            k_lo = tl.where(mask_k_lo[None, :], k_lo, 0.0)
+            qk = tl.dot(q_lo, tl.trans(k_lo))
+            k_hi = _cvt_e2m1_hi(kbyte).to(tl.bfloat16) * k_scale
+            k_hi = tl.where(mask_k_hi[None, :], k_hi, 0.0)
+            qk = tl.dot(q_hi, tl.trans(k_hi), qk)
             qk *= sm_scale
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end),
@@ -539,25 +664,24 @@ def _mxfp4_grouped_decode_stage1_kernel(
                 other=0,
             )
             vsbytes = tl.load(
-                V_Scales + vs_row[:, None] + blk_idx_v[None, :],
-                mask=tok_mask[:, None] & (blk_idx_v[None, :] < NUM_V_BLOCKS),
+                V_Scales + vs_row[:, None] + offs_sblk_v[None, :],
+                mask=tok_mask[:, None] & (offs_sblk_v[None, :] < NUM_V_BLOCKS),
                 other=0,
             )
-            v_scale_base = vsbytes.to(tl.int32) << 4
-            v_lo = tl.load(E2M1_LUT + (v_scale_base | (vbyte & 0x0F)))
-            v_hi = tl.load(E2M1_LUT + (v_scale_base | ((vbyte >> 4) & 0x0F)))
-            v_lo = tl.where(mask_v_lo[None, :], v_lo, 0.0)
-            v_hi = tl.where(mask_v_hi[None, :], v_hi, 0.0)
+            v_scale = _broadcast_scale(vsbytes, BLOCK_N, SCALE_TILE_V, HALF_DV)
 
             # --- online softmax (fp32), same recurrence as the stock kernel
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
-            p_cast = p.to(v_lo.dtype)
-            acc_lo *= re_scale[:, None]
-            acc_lo += tl.dot(p_cast, v_lo)
-            acc_hi *= re_scale[:, None]
-            acc_hi += tl.dot(p_cast, v_hi)
+            p_cast = p.to(tl.bfloat16)
+
+            v_lo = _cvt_e2m1_lo(vbyte).to(tl.bfloat16) * v_scale
+            v_lo = tl.where(mask_v_lo[None, :], v_lo, 0.0)
+            acc_lo = tl.dot(p_cast, v_lo, acc_lo * re_scale[:, None])
+            v_hi = _cvt_e2m1_hi(vbyte).to(tl.bfloat16) * v_scale
+            v_hi = tl.where(mask_v_hi[None, :], v_hi, 0.0)
+            acc_hi = tl.dot(p_cast, v_hi, acc_hi * re_scale[:, None])
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -884,6 +1008,11 @@ def mxfp4_decode_attention_fwd(
             PACKED_V_DIM=packed_v_dim,
             NUM_K_BLOCKS=num_k_blocks,
             NUM_V_BLOCKS=num_v_blocks,
+            # How many E8M0 blocks a half-dim tile spans. A power of two, since
+            # HALF_D is one and the block is 16 packed bytes; clamped to 1 so a
+            # head_dim below one full block still reshapes.
+            SCALE_TILE_K=max(1, max(1, BLOCK_DMODEL // 2) // _HALF_BLOCK),
+            SCALE_TILE_V=max(1, max(1, BLOCK_DV // 2) // _HALF_BLOCK),
             BLOCK_N=block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
             Lk=logical_k,

@@ -60,6 +60,32 @@ def _dequant_arith(code, sbyte):
 
 
 @triton.jit
+def _cvt_e2m1_pair(byte):
+    """Packed-FP4 byte -> u32 holding two f16 values, via one SASS instruction.
+
+    Needs the arch-specific target: ptxas accepts cvt.rn.f16x2.e2m1x2 for
+    sm_120a / sm_100a and rejects it for plain sm_120. The source operand must
+    be a .b8 register -- passing .b16 gets "Arguments mismatch", which is a
+    syntax error and not an unsupported-instruction error.
+    """
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 b0; mov.b32 {b0, _, _, _}, $1; cvt.rn.f16x2.e2m1x2 $0, b0; }",
+        "=r,r",
+        [byte.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _unpack_f16x2(pair):
+    lo = (pair & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+    hi = (pair >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    return lo.to(tl.float32), hi.to(tl.float32)
+
+
+@triton.jit
 def _twin_kernel(
     K_Packed,
     V_Packed,
@@ -163,6 +189,31 @@ def _twin_kernel(
                 acc_f += _dequant_arith((ki >> 4) & 0x0F, ks)
                 acc_f += _dequant_arith(vi & 0x0F, vs)
                 acc_f += _dequant_arith((vi >> 4) & 0x0F, vs)
+            elif MODE == 4 or MODE == 5:
+                # Hardware FP4 decode: one F2FP.F16.E2M1.UNPACK_B per packed
+                # byte yields both nibbles as an f16x2 pair, replacing the LUT
+                # gather entirely. Same asm flashinfer's XQA uses
+                # (csrc/xqa/utils.cuh::convertKCacheWordToF16).
+                kpair = _cvt_e2m1_pair(kbyte)
+                vpair = _cvt_e2m1_pair(vbyte)
+                klo, khi = _unpack_f16x2(kpair)
+                vlo, vhi = _unpack_f16x2(vpair)
+                if MODE == 4:
+                    # Naive: apply the E8M0 scale per element, as the LUT does.
+                    ksc = ((ksb.to(tl.int32) << 7) & 0xFFFF).to(tl.uint16)
+                    vsc = ((vsb.to(tl.int32) << 7) & 0xFFFF).to(tl.uint16)
+                    ksc = ksc.to(tl.bfloat16, bitcast=True).to(tl.float32)
+                    vsc = vsc.to(tl.bfloat16, bitcast=True).to(tl.float32)
+                    acc_f += (klo + khi) * ksc
+                    acc_f += (vlo + vhi) * vsc
+                else:
+                    # Scale hoisted out of the element path: the E8M0 exponent
+                    # is constant over a 32-element d block, so it can ride on
+                    # the per-block dot partial instead (8 scalar multiplies per
+                    # token-head rather than 256 element-wise ones). This mode
+                    # prices the element path alone.
+                    acc_f += klo + khi
+                    acc_f += vlo + vhi
             else:
                 acc_i += (
                     kbyte.to(tl.int32)
@@ -317,6 +368,8 @@ def analyse(seq_len, kv, q):
     t_lut = cold_time(make_twin(1), thrash)
     t_lut16 = cold_time(make_twin(2), thrash)
     t_arith = cold_time(make_twin(3), thrash)
+    t_cvt_sc = cold_time(make_twin(4), thrash)
+    t_cvt = cold_time(make_twin(5), thrash)
 
     # Per-kernel split: the sweep only ever reported stage1 + stage2 together.
     # Profiled inside the same cold-L2 loop so the split matches t_full.
@@ -359,7 +412,8 @@ def analyse(seq_len, kv, q):
     print(f"  measured  : fwd cold {t_full:.4f} ms (warm/graph {t_full_warm:.4f}) "
           f"= stage1 {t_s1:.4f} + stage2 {t_s2:.4f}")
     print(f"  twin cold : loads {t_mem:.4f} | +LUT4096 {t_lut:.4f} "
-          f"| +LUT16*scale {t_lut16:.4f} | +arith {t_arith:.4f} ms")
+          f"| +LUT16*scale {t_lut16:.4f} | +arith {t_arith:.4f} "
+          f"| +cvt*scale {t_cvt_sc:.4f} | +cvt only {t_cvt:.4f} ms")
     print(f"  --> MBU   : stage1 {total_bytes / (t_s1 / 1e3) / 1e9 / PEAK_READ_GBPS * 100:5.1f}% "
           f"| twin {total_bytes / (t_mem / 1e3) / 1e9 / PEAK_READ_GBPS * 100:5.1f}% "
           f"({total_bytes / (t_s1 / 1e3) / 1e9:.0f} GB/s vs twin "
@@ -372,7 +426,12 @@ def analyse(seq_len, kv, q):
           f"| LUT gather +{t_lut - t_mem:.4f} ({(t_lut - t_mem) / t_s1 * 100:.0f}%) "
           f"| dot+softmax +{t_s1 - t_lut:.4f} ({(t_s1 - t_lut) / t_s1 * 100:.0f}%)")
     print(f"  --> dequant cost over loads: LUT4096 +{t_lut - t_mem:.4f} | "
-          f"LUT16*scale +{t_lut16 - t_mem:.4f} | arith +{t_arith - t_mem:.4f} ms")
+          f"LUT16*scale +{t_lut16 - t_mem:.4f} | arith +{t_arith - t_mem:.4f} | "
+          f"hw-cvt*scale +{t_cvt_sc - t_mem:.4f} | hw-cvt only +{t_cvt - t_mem:.4f} ms")
+    best = min(t_cvt_sc, t_cvt)
+    print(f"  --> if dequant were hw-cvt: stage1 ~{t_s1 - (t_lut - best):.4f} ms "
+          f"({(best - t_lut) / t_s1 * 100:+.1f}%), MBU "
+          f"{total_bytes / ((t_s1 - (t_lut - best)) / 1e3) / 1e9 / PEAK_READ_GBPS * 100:.1f}%")
     print(f"  --> gap   : stage1/roofline {t_s1 / floor_ms:.2f}x | "
           f"stage1/twin {t_s1 / t_mem:.2f}x | twin/roofline {t_mem / floor_ms:.2f}x")
 
