@@ -138,6 +138,11 @@ class ForwardMetadata:
     lean_Lp: Optional[torch.Tensor] = None
     lean_Op: Optional[torch.Tensor] = None
     lean_locks: Optional[torch.Tensor] = None
+    # Page-granular index for the native MXFP4 decode kernel: (bs, max_pages)
+    # block ids, one per page, instead of kv_indices' one slot id per token.
+    # Purely an optimization hint -- None falls the kernel back to kv_indices,
+    # which stays authoritative either way.
+    mxfp4_page_table: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -439,6 +444,35 @@ class TritonAttnBackend(AttentionBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
+        # Page-granular index buffer for the native MXFP4 decode. The kernel can
+        # read one page id per BLOCK_N tile instead of one slot id per token,
+        # which takes the whole tile's pointer vector out of its inner loop; that
+        # is only sound when a tile cannot straddle two pages, hence the
+        # divisibility gates. Allocated once and filled in place so cuda-graph
+        # replay sees a stable address.
+        self.mxfp4_page_table = None
+        # Whether the buffer currently holds a valid fill for the replayed batch.
+        self._mxfp4_page_table_filled = False
+        if self.mxfp4_native_decode and not get_bool_env_var(
+            "SGLANG_DISABLE_MXFP4_PAGED_INDEX", "false"
+        ):
+            from sglang.kernels.ops.attention.decode_attention_mxfp4_sm120 import (
+                _BLOCK_N as _MXFP4_BLOCK_N,
+            )
+            from sglang.kernels.ops.attention.decode_attention_mxfp4_sm120 import (
+                _MIN_BLOCK_KV as _MXFP4_MIN_BLOCK_KV,
+            )
+
+            if (
+                self.page_size % _MXFP4_BLOCK_N == 0
+                and _MXFP4_MIN_BLOCK_KV % _MXFP4_BLOCK_N == 0
+            ):
+                self.mxfp4_page_table = torch.zeros(
+                    (max_bs, triton.cdiv(self.max_context_len, self.page_size)),
+                    dtype=torch.int32,
+                    device=model_runner.device,
+                )
+
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
         # the kernel's actual tile size.
@@ -552,6 +586,40 @@ class TritonAttnBackend(AttentionBackend):
         )
         return kv_indptr
 
+    def _fill_mxfp4_page_table(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Fill the page-granular index for the native MXFP4 decode, or None.
+
+        One entry per page, read at the page boundary out of ``req_to_token`` and
+        divided down to a block id -- the same construction the trtllm_mha
+        backend uses, reusing its kernel. Returning None on any unsupported
+        config leaves the kernel on ``kv_indices``, which describes the same
+        mapping.
+        """
+        if self.mxfp4_page_table is None or self.dcp_size > 1:
+            return None
+        if self.kv_index_translator.is_translating:
+            # The unified pool's read ids go through a virtual->physical table,
+            # so req_to_token entries are not the ids the kernel addresses with.
+            return None
+        from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+            build_trtllm_mha_page_table,
+        )
+
+        page_table = self.mxfp4_page_table[:bs]
+        build_trtllm_mha_page_table(
+            self.kv_index_translator.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            page_table,
+            self.page_size,
+        )
+        return page_table
+
     def _update_decode_kv_buffers(
         self,
         bs: int,
@@ -583,6 +651,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            )
+            self._mxfp4_page_table_filled = (
+                self._fill_mxfp4_page_table(bs, seq_lens, req_pool_indices) is not None
             )
             num_kv_splits_lens = seq_lens
         window_kv_indptr = self.window_kv_indptr
@@ -835,6 +906,9 @@ class TritonAttnBackend(AttentionBackend):
         # Lean decode buffers are only allocated on the decode path below; default
         # to None so the shared ForwardMetadata constructor works for extend/verify.
         lean_Mp = lean_Lp = lean_Op = lean_locks = None
+        # Only the plain decode path below builds one; everywhere else the
+        # kernel stays on kv_indices.
+        mxfp4_page_table = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
@@ -860,6 +934,11 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.seq_lens,
                         forward_batch.req_pool_indices,
                         kv_indices,
+                    )
+                    mxfp4_page_table = self._fill_mxfp4_page_table(
+                        bs,
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
                     )
                 if (
                     self.sliding_window_size is not None
@@ -1084,6 +1163,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
             lean_locks=lean_locks,
+            mxfp4_page_table=mxfp4_page_table,
         )
 
     def init_cuda_graph_state(
@@ -1251,6 +1331,11 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Lp=self.cuda_graph_lean_Lp,
                 lean_Op=self.cuda_graph_lean_Op,
                 lean_locks=self.cuda_graph_lean_locks,
+                mxfp4_page_table=(
+                    self.mxfp4_page_table[:bs]
+                    if self._mxfp4_page_table_filled
+                    else None
+                ),
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -2305,6 +2390,7 @@ class TritonAttnBackend(AttentionBackend):
                 attn_logits=attn_logits,
                 attn_lse=self.forward_metadata.attn_lse,
                 num_kv_splits=self.forward_metadata.num_kv_splits,
+                page_table=self.forward_metadata.mxfp4_page_table,
             )
             return o
 

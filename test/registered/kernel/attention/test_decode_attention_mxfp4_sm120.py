@@ -282,6 +282,31 @@ def _build_req_locs(layout, seq_lens, num_slots, seed):
 
     if layout == "contiguous":
         return _split(list(range(1, 1 + total)))
+    if layout.startswith("shuffled_whole_pages"):
+        # Whole pages permuted, each request given whole pages -- what a paged
+        # allocator produces, and the only layout the page-granular index can
+        # describe. Page size is encoded in the layout name so _build_req_locs
+        # stays a pure function of it.
+        #
+        # Both properties matter and neither is incidental: the page table is
+        # built by reading req_to_token at every page boundary, so a request
+        # whose slots do not start page-aligned (or whose pages are not whole)
+        # would get a table that disagrees with kv_indices. Page 0 is skipped
+        # whole rather than filtered slot-wise, which would shift the rest.
+        ps = int(layout.rsplit("_", 1)[-1])
+        pages_per_req = [-(-s // ps) for s in seq_lens]
+        npages = (num_slots // ps) - 1  # page 0 reserved with slot 0
+        if npages < sum(pages_per_req):
+            raise ValueError(
+                f"slot pool holds {npages} usable pages, need {sum(pages_per_req)}"
+            )
+        perm = [p + 1 for p in torch.randperm(npages, generator=g).tolist()]
+        reqs, cur = [], 0
+        for s, npg in zip(seq_lens, pages_per_req):
+            slots = [pg * ps + j for pg in perm[cur : cur + npg] for j in range(ps)]
+            reqs.append(slots[:s])
+            cur += npg
+        return reqs
     if layout == "shuffled_pages":
         perm = torch.randperm(num_slots - 1, generator=g).tolist()
         return _split([i + 1 for i in perm[:total]])
@@ -354,6 +379,7 @@ def _run_decode_case(
     prefix_lens,
     layout="shuffled_pages",
     pool_layout="combined",
+    paged_index=False,
     seed=20260903,
     zero_first_request=False,
     max_kv_splits=8,
@@ -363,7 +389,9 @@ def _run_decode_case(
     seq_lens = [p + 1 for p in prefix_lens]  # decode: current token included
     batch = len(seq_lens)
     total = sum(seq_lens)
-    num_slots = total + page_size + 16
+    # Enough for whole-page-per-request allocation (the paged layouts round each
+    # request up to a page), plus the reserved page 0.
+    num_slots = total + (batch + 2) * page_size + 16
 
     packed_dim = head_dim // 2
     num_blocks = head_dim // 32
@@ -406,6 +434,17 @@ def _run_decode_case(
     kv_indices = torch.tensor(
         [loc for locs in req_locs for loc in locs], dtype=torch.int32, device=_DEVICE
     )
+    page_table = None
+    if paged_index:
+        # One entry per page, read at the page boundary and divided down -- the
+        # same construction build_trtllm_mha_page_table performs on-device. It
+        # describes the same mapping as kv_indices, so the result has to match
+        # the torch oracle exactly as the token-level path does.
+        max_pages = -(-max(seq_lens) // page_size)
+        page_table = torch.zeros((batch, max_pages), dtype=torch.int32, device=_DEVICE)
+        for i in range(batch):
+            pages = req_to_token[i, : seq_lens[i] : page_size] // page_size
+            page_table[i, : pages.numel()] = pages.to(torch.int32)
     mxfp4_decode_attention_fwd(
         q,
         k_pool,
@@ -418,6 +457,7 @@ def _run_decode_case(
         scaling,
         page_size=page_size,
         max_kv_splits=max_kv_splits,
+        page_table=page_table,
     )
 
     refs = [
@@ -478,6 +518,37 @@ _DECODE_CASES = (
         (31,),
         "contiguous",
         {"pool_layout": "separate"},
+    ),
+    (
+        "qwen_24_4_256_paged_index",
+        24,
+        4,
+        256,
+        64,
+        (255,),
+        "shuffled_whole_pages_64",
+        {"paged_index": True},
+    ),
+    (
+        "qwen_24_4_256_paged_index_partial_last_page",
+        24,
+        4,
+        256,
+        64,
+        (64, 200),
+        "shuffled_whole_pages_64",
+        {"paged_index": True},
+    ),
+    (
+        # page_size 16 < BLOCK_N: the hint must be ignored, not misapplied.
+        "qwen_24_4_256_paged_index_falls_back",
+        24,
+        4,
+        256,
+        16,
+        (31,),
+        "shuffled_whole_pages_16",
+        {"paged_index": True},
     ),
     (
         "qwen_24_4_256_zero_req",

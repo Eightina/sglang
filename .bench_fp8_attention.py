@@ -25,6 +25,7 @@ reads the padding, so the traffic and MBU columns are the same for both.
     python .bench_fp8_attention.py [seq_len ...]
 """
 
+import os
 import sys
 
 import torch
@@ -42,6 +43,39 @@ SM_SCALE = 1.0 / (HEAD_DIM**0.5)
 # Combined-layout row width: 128 code bytes + 8 scale bytes + 8 pad, the
 # narrowest width that keeps every row base 16-byte aligned.
 COMB_WIDTH = 144
+# Page size for the page-granular index arm. Must be a multiple of the kernel's
+# BLOCK_N so a tile cannot straddle two pages.
+PS_TEST = 64
+
+
+def build_mapping(seq_len, shuffle, gen):
+    """One slot mapping in both index forms: token-granular and page-granular.
+
+    Both describe the same mapping, so the two kernel arms read exactly the same
+    bytes in the same order and only the index form differs. ``shuffle`` permutes
+    whole pages, which is what a real allocator produces; the identity mapping is
+    kept as a separate row because it flatters the token-level arm (its index
+    stream becomes a perfectly coalesced sequential read).
+    """
+    npages = triton.cdiv(seq_len, PS_TEST)
+    if shuffle:
+        perm = torch.randperm(npages, device=DEV, generator=gen)
+    else:
+        perm = torch.arange(npages, device=DEV)
+    toks = perm[:, None] * PS_TEST + torch.arange(PS_TEST, device=DEV)[None, :]
+    return (
+        toks.reshape(-1)[:seq_len].to(torch.int32).contiguous(),
+        perm.view(1, npages).to(torch.int32).contiguous(),
+        npages,
+    )
+
+
+# The index stream is the one input a real decode loop re-reads: all layers of
+# one step share it, so after the first layer it is L2-resident. Thrashing before
+# every iteration charges it to DRAM every time, which overstates any saving that
+# comes from index traffic rather than from index *work*. WARM=1 measures the
+# other regime.
+WARM = os.environ.get("WARM") == "1"
 
 
 def cold_time(run, thrash, iters=ITERS):
@@ -50,7 +84,8 @@ def cold_time(run, thrash, iters=ITERS):
     torch.cuda.synchronize()
     pairs = []
     for i in range(iters):
-        thrash.fill_(i & 0xFF)
+        if not WARM:
+            thrash.fill_(i & 0xFF)
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -67,7 +102,8 @@ def split_stages(run, thrash, iters=20):
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for i in range(iters):
-            thrash.fill_(i & 0xFF)
+            if not WARM:
+                thrash.fill_(i & 0xFF)
             run()
         torch.cuda.synchronize()
     t1 = t2 = 0.0
@@ -97,7 +133,9 @@ def to_combined(packed, scales, width):
 
 def main():
     seq_lens = [int(a) for a in sys.argv[1:]] or [32768, 100000, 150000]
-    max_slots = max(seq_lens) + 16
+    # Rounded up to a whole number of pages: the page-granular arm addresses the
+    # last partial page's slots even though the mask discards them.
+    max_slots = triton.cdiv(max(seq_lens), PS_TEST) * PS_TEST + PS_TEST
     gen = torch.Generator(device=DEV).manual_seed(1234)
     ref = torch.randn(
         (max_slots, KV_HEADS, HEAD_DIM),
@@ -151,34 +189,14 @@ def main():
     )
 
     print(
-        f"\n{'seq':>8} | {'layout':<17} | {'ms':>8} {'s1':>7} {'s2':>7} "
+        f"\n{'seq':>8} | {'map':<5} | {'layout':<17} | {'ms':>8} {'s1':>7} {'s2':>7} "
         f"{'MiB':>7} {'GB/s':>6} {'MBU':>6} | {'vs FP8':>8}"
     )
+    map_gen = torch.Generator(device=DEV).manual_seed(4242)
     for seq_len in seq_lens:
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=DEV)
-        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=DEV)
         last_page = torch.ones(BATCH, dtype=torch.int32, device=DEV)
-
-        wrapper.begin_forward(
-            kv_indptr,
-            kv_indices,
-            last_page,
-            Q_HEADS,
-            KV_HEADS,
-            HEAD_DIM,
-            PAGE_SIZE,
-            data_type=torch.float8_e4m3fn,
-            q_data_type=torch.bfloat16,
-            non_blocking=False,
-        )
         qf = q.view(-1, Q_HEADS, HEAD_DIM).contiguous()
-
-        def run_fp8():
-            wrapper.forward(
-                qf, (k_fp8, v_fp8), sm_scale=SM_SCALE, k_scale=1.0, v_scale=1.0
-            )
-
-        t_fp8 = cold_time(run_fp8, thrash)
 
         o = torch.empty((BATCH, Q_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEV)
         splits = max(1, min(max_splits, triton.cdiv(seq_len, mod._MIN_BLOCK_KV)))
@@ -190,58 +208,99 @@ def main():
             (BATCH, Q_HEADS, max_splits), dtype=torch.float32, device=DEV
         )
 
-        def make_run(k_p, v_p, k_s, v_s):
-            def run():
-                mod.mxfp4_decode_attention_fwd(
-                    q,
-                    k_p,
-                    v_p,
-                    k_s,
-                    v_s,
-                    o,
-                    kv_indptr,
-                    kv_indices,
-                    SM_SCALE,
-                    page_size=PAGE_SIZE,
-                    max_kv_splits=max_splits,
-                    attn_logits=attn_logits,
-                    attn_lse=attn_lse,
-                    num_kv_splits=num_kv_splits,
-                    num_warps=num_warps,
-                )
+        for map_tag, shuffle in (("ident", False), ("shuf", True)):
+            kv_indices, page_table, npages = build_mapping(seq_len, shuffle, map_gen)
 
-            return run
-
-        fp8_b = seq_len * fp8_bytes_per_tok
-        # MXFP4 also streams kv_indices once per head tile and round-trips the
-        # fp32 split partials through stage 2. The combined layout's row padding
-        # is never read, so both layouts move the same bytes.
-        mx_b = (
-            seq_len * mx_bytes_per_tok
-            + head_tiles * seq_len * 4
-            + 2 * BATCH * Q_HEADS * splits * (HEAD_DIM + 1) * 4
-        )
-
-        def row(label, t, nbytes, t1=None, t2=None):
-            gbps = nbytes / (t / 1e3) / 1e9
-            s1 = f"{t1:>7.4f}" if t1 is not None else f"{'-':>7}"
-            s2 = f"{t2:>7.4f}" if t2 is not None else f"{'-':>7}"
-            vs = "--" if t is t_fp8 else f"{t / t_fp8 - 1:+.1%}"
-            print(
-                f"{seq_len:>8} | {label:<17} | {t:>8.4f} {s1} {s2} "
-                f"{nbytes / 2**20:>7.1f} {gbps:>6.0f} "
-                f"{gbps / PEAK_READ_GBPS * 100:>5.1f}% | {vs:>8}"
+            wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                last_page,
+                Q_HEADS,
+                KV_HEADS,
+                HEAD_DIM,
+                PAGE_SIZE,
+                data_type=torch.float8_e4m3fn,
+                q_data_type=torch.bfloat16,
+                non_blocking=False,
             )
 
-        row("FP8 (flashinfer)", t_fp8, fp8_b)
-        for label, args in (
-            ("MXFP4 separate", (kp, vp, ks, vs)),
-            (f"MXFP4 comb {COMB_WIDTH}", (kcv, vcv, ksv, vsv)),
-        ):
-            run = make_run(*args)
-            t = cold_time(run, thrash)
-            t1, t2 = split_stages(run, thrash)
-            row(label, t, mx_b, t1, t2)
+            def run_fp8():
+                wrapper.forward(
+                    qf, (k_fp8, v_fp8), sm_scale=SM_SCALE, k_scale=1.0, v_scale=1.0
+                )
+
+            t_fp8 = cold_time(run_fp8, thrash)
+
+            def make_run(k_p, v_p, k_s, v_s, page_size, pt):
+                def run():
+                    mod.mxfp4_decode_attention_fwd(
+                        q,
+                        k_p,
+                        v_p,
+                        k_s,
+                        v_s,
+                        o,
+                        kv_indptr,
+                        kv_indices,
+                        SM_SCALE,
+                        page_size=page_size,
+                        max_kv_splits=max_splits,
+                        attn_logits=attn_logits,
+                        attn_lse=attn_lse,
+                        num_kv_splits=num_kv_splits,
+                        num_warps=num_warps,
+                        page_table=pt,
+                    )
+
+                return run
+
+            fp8_b = seq_len * fp8_bytes_per_tok
+
+            def mx_bytes(index_entries):
+                # MXFP4 also streams its index once per head tile and round-trips
+                # the fp32 split partials through stage 2. The combined layout's
+                # row padding is never read, so both layouts move the same bytes;
+                # the paged arm's index is seq_len/PS_TEST times smaller, which
+                # has to be in the total or its MBU reads high.
+                return (
+                    seq_len * mx_bytes_per_tok
+                    + head_tiles * index_entries * 4
+                    + 2 * BATCH * Q_HEADS * splits * (HEAD_DIM + 1) * 4
+                )
+
+            def row(label, t, nbytes, t1=None, t2=None):
+                gbps = nbytes / (t / 1e3) / 1e9
+                s1 = f"{t1:>7.4f}" if t1 is not None else f"{'-':>7}"
+                s2 = f"{t2:>7.4f}" if t2 is not None else f"{'-':>7}"
+                vs = "--" if t is t_fp8 else f"{t / t_fp8 - 1:+.1%}"
+                print(
+                    f"{seq_len:>8} | {map_tag:<5} | {label:<17} | {t:>8.4f} {s1} {s2} "
+                    f"{nbytes / 2**20:>7.1f} {gbps:>6.0f} "
+                    f"{gbps / PEAK_READ_GBPS * 100:>5.1f}% | {vs:>8}"
+                )
+
+            row("FP8 (flashinfer)", t_fp8, fp8_b)
+            arms = [
+                (f"MXFP4 comb tok", (kcv, vcv, ksv, vsv), 1, None, seq_len),
+                (
+                    f"MXFP4 comb paged",
+                    (kcv, vcv, ksv, vsv),
+                    PS_TEST,
+                    page_table,
+                    npages,
+                ),
+            ]
+            if not shuffle:
+                # Kept only on the identity mapping, as continuity with the
+                # section 2 table; the decision here is between the two index
+                # forms, both on the combined layout.
+                arms.insert(0, ("MXFP4 separate", (kp, vp, ks, vs), 1, None, seq_len))
+            for label, bufs, ps, pt, idx_entries in arms:
+                run = make_run(*bufs, ps, pt)
+                t = cold_time(run, thrash)
+                t1, t2 = split_stages(run, thrash)
+                row(label, t, mx_bytes(idx_entries), t1, t2)
+        print()
 
 
 if __name__ == "__main__":

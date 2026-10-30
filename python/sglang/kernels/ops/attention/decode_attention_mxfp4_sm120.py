@@ -35,7 +35,11 @@ _MXFP4_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE)
 _MXFP4_HALF_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE // 2)
 # Same value outside triton's constexpr wrapper, for launch-time tile sizing.
 _HALF_BLOCK = MXFP4_BLOCK_SIZE // 2
-_MIN_BLOCK_KV = 32
+# Split granularity. A multiple of _BLOCK_N so that every ``start_n`` the stage-1
+# loop visits is BLOCK_N-aligned, which is what lets the page-granular index path
+# assume a tile never straddles two pages. Measured neutral-to-slightly-positive
+# against 32 on its own (section 5 of mxfp4_decode_layout_ws_profiling.md).
+_MIN_BLOCK_KV = 64
 _BLOCK_N = 64
 _GROUPED_BLOCK_H = 16
 
@@ -476,6 +480,8 @@ def _mxfp4_grouped_decode_stage1_kernel(
     sm_scale,
     kv_indptr,
     kv_indices,
+    PageTable,
+    stride_pt_b,
     Att_Out,
     Att_Lse,
     num_kv_splits,
@@ -509,6 +515,7 @@ def _mxfp4_grouped_decode_stage1_kernel(
     NUM_V_BLOCKS: tl.constexpr,
     SCALE_TILE_K: tl.constexpr,
     SCALE_TILE_V: tl.constexpr,
+    PAGED_INDEX: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     Lk: tl.constexpr,
@@ -604,32 +611,57 @@ def _mxfp4_grouped_decode_stage1_kernel(
             Q + offs_q_hi, mask=mask_h[:, None] & mask_k_hi[None, :], other=0.0
         )
 
+        # Row offsets are affine in ``offs_n`` under PAGED_INDEX, so the lane
+        # ramp is loop-invariant: the body only adds a scalar base. Hoisted here
+        # rather than recomputed per tile.
+        ramp_kp = tl.arange(0, BLOCK_N) * stride_kp_bs
+        ramp_vp = tl.arange(0, BLOCK_N) * stride_vp_bs
+        ramp_ks = tl.arange(0, BLOCK_N) * stride_ks_bs
+        ramp_vs = tl.arange(0, BLOCK_N) * stride_vs_bs
+
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             tok_mask = offs_n < split_kv_end
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=tok_mask,
-                other=0,
-            )
-            if PAGE_SIZE == 1:
-                k_row = kv_loc * stride_kp_bs + cur_kv_head * stride_kp_h
-                v_row = kv_loc * stride_vp_bs + cur_kv_head * stride_vp_h
+            if PAGED_INDEX:
+                # One scalar page entry per tile instead of BLOCK_N token ids.
+                # Valid because the tile lies inside a single page (the launcher
+                # checks PAGE_SIZE % BLOCK_N == 0 and MIN_BLOCK_KV % BLOCK_N == 0,
+                # which makes every start_n page-aligned mod BLOCK_N) and because
+                # a page's slots are PAGE_SIZE consecutive ids -- the same
+                # contract the token-level index builder relies on when it
+                # expands ``token = entry * ps + pos % ps``.
+                page_slot = tl.load(
+                    PageTable + cur_batch * stride_pt_b + start_n // PAGE_SIZE
+                )
+                slot0 = page_slot * PAGE_SIZE + start_n % PAGE_SIZE
+                k_row = slot0 * stride_kp_bs + cur_kv_head * stride_kp_h + ramp_kp
+                v_row = slot0 * stride_vp_bs + cur_kv_head * stride_vp_h + ramp_vp
+                ks_row = slot0 * stride_ks_bs + cur_kv_head * stride_ks_h + ramp_ks
+                vs_row = slot0 * stride_vs_bs + cur_kv_head * stride_vs_h + ramp_vs
             else:
-                page_id = kv_loc // PAGE_SIZE
-                tok_in_p = kv_loc % PAGE_SIZE
-                k_row = (
-                    page_id * stride_kp_page
-                    + tok_in_p * stride_kp_tok
-                    + cur_kv_head * stride_kp_h
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=tok_mask,
+                    other=0,
                 )
-                v_row = (
-                    page_id * stride_vp_page
-                    + tok_in_p * stride_vp_tok
-                    + cur_kv_head * stride_vp_h
-                )
-            ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
-            vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
+                if PAGE_SIZE == 1:
+                    k_row = kv_loc * stride_kp_bs + cur_kv_head * stride_kp_h
+                    v_row = kv_loc * stride_vp_bs + cur_kv_head * stride_vp_h
+                else:
+                    page_id = kv_loc // PAGE_SIZE
+                    tok_in_p = kv_loc % PAGE_SIZE
+                    k_row = (
+                        page_id * stride_kp_page
+                        + tok_in_p * stride_kp_tok
+                        + cur_kv_head * stride_kp_h
+                    )
+                    v_row = (
+                        page_id * stride_vp_page
+                        + tok_in_p * stride_vp_tok
+                        + cur_kv_head * stride_vp_h
+                    )
+                ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
+                vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
 
             # --- K: one byte load + one scale load feed the hardware E2M1
             # converter; the group shares the resulting bf16 tiles. The halves
@@ -828,6 +860,7 @@ def mxfp4_decode_attention_fwd(
     block_n: int = _BLOCK_N,
     num_warps: int | None = None,
     stage2_num_stages: int = _STAGE2_NUM_STAGES,
+    page_table: torch.Tensor | None = None,
 ):
     """Native MXFP4 decode attention over packed paged KV.
 
@@ -848,6 +881,14 @@ def mxfp4_decode_attention_fwd(
     on-device schedule instead. ``num_warps=None`` takes the per-path
     production value from ``stage1_launch_config``; pass an explicit value
     only to sweep configs.
+
+    ``page_table`` is the optional page-granular index: ``(batch, max_pages)``
+    int32 holding one page id per page instead of one slot id per token. When
+    given (grouped path only, and only when the tile/page geometry below checks
+    out) the kernel reads one scalar per tile and derives the row offsets
+    affinely, which takes the whole BLOCK_N pointer vector out of the inner
+    loop. ``kv_indices`` must still be passed and stay authoritative for
+    anything else; the two must describe the same mapping.
     """
     batch, head_num, head_dim = q.shape
     kv_head_num = k_packed.shape[1]
@@ -929,6 +970,28 @@ def mxfp4_decode_attention_fwd(
     ks_slot_stride, ks_head_stride, _, _ = _extract_kv_strides(k_scales, 1)
     vs_slot_stride, vs_head_stride, _, _ = _extract_kv_strides(v_scales, 1)
 
+    # The page-granular index is only sound when a BLOCK_N tile cannot straddle
+    # two pages, since the kernel reads a single page id for the whole tile.
+    # ``start_n`` walks from ``split_kv_start``, a multiple of MIN_BLOCK_KV, in
+    # BLOCK_N steps, so both have to be page-compatible. Falling back rather
+    # than raising keeps the argument an optimization hint: kv_indices stays
+    # authoritative, so the slow path is always correct.
+    paged_index = (
+        page_table is not None
+        and kv_group_num != 1  # grouped kernel only; the MHA one has no arg
+        and page_size % block_n == 0
+        and _MIN_BLOCK_KV % block_n == 0
+    )
+    if paged_index:
+        if page_table.ndim != 2 or page_table.shape[0] != batch:
+            raise ValueError(
+                f"page_table must be (batch, max_pages), got {tuple(page_table.shape)} "
+                f"for batch {batch}"
+            )
+        # The column count is the caller's responsibility: checking it against
+        # the longest sequence here would need a device->host sync on kv_indptr.
+    pt_row_stride = page_table.stride(0) if paged_index else 0
+
     if kv_group_num == 1:
         # MHA: one query head per kv head -> no redundant K/V reads; the
         # per-head kernel keeps exact element-wise fp32 math.
@@ -994,6 +1057,8 @@ def mxfp4_decode_attention_fwd(
             sm_scale,
             kv_indptr,
             kv_indices,
+            page_table if paged_index else kv_indices,
+            pt_row_stride,
             attn_logits,
             attn_lse,
             num_kv_splits,
@@ -1032,6 +1097,7 @@ def mxfp4_decode_attention_fwd(
             # head_dim below one full block still reshapes.
             SCALE_TILE_K=max(1, max(1, BLOCK_DMODEL // 2) // _HALF_BLOCK),
             SCALE_TILE_V=max(1, max(1, BLOCK_DV // 2) // _HALF_BLOCK),
+            PAGED_INDEX=paged_index,
             BLOCK_N=block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
             Lk=logical_k,
