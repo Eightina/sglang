@@ -15,6 +15,7 @@ Three measurements, all at the production launch config:
 
     python .roofline_mxfp4_decode.py [seq_len ...]
 """
+
 import sys
 
 import torch
@@ -138,9 +139,7 @@ def _twin_kernel(
         for start_n in range(split_start, split_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             tok_mask = offs_n < split_end
-            kv_loc = tl.load(
-                kv_indices + kv_start + offs_n, mask=tok_mask, other=0
-            )
+            kv_loc = tl.load(kv_indices + kv_start + offs_n, mask=tok_mask, other=0)
             row = kv_loc * stride_kp_bs + cur_kv_head * stride_kp_h
             s_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
 
@@ -283,19 +282,33 @@ def graph_time(run):
     return s.elapsed_time(e) / ITERS
 
 
+# "write" (fill_) evicts L2 but leaves up to an L2's worth of dirty lines whose
+# writeback competes for DRAM with the measured kernel -- bandwidth pollution on
+# top of the cold cache, which inflates every number taken this way. A decode
+# step evicts a layer's KV with other layers' reads, a clean eviction, so "read"
+# is the faithful model. Default kept at "write" so historical numbers reproduce.
+FLUSH = __import__("os").environ.get("FLUSH", "write")
+_sink = None
+
+
 def cold_time(run, thrash, iters=ITERS):
     """Time per launch with L2 evicted first, which is the production state.
 
-    The thrashing write stays outside the event window, so only the target
-    launch is timed; all iterations are queued before syncing to keep the GPU
-    saturated and the device-side timestamps gap-free.
+    The eviction stays outside the event window, so only the target launch is
+    timed; all iterations are queued before syncing to keep the GPU saturated
+    and the device-side timestamps gap-free. See FLUSH above for why the
+    eviction's *kind* changes the result even though its time is excluded.
     """
+    global _sink
     for _ in range(3):
         run()
     torch.cuda.synchronize()
     pairs = []
     for i in range(iters):
-        thrash.fill_(i & 0xFF)
+        if FLUSH == "read":
+            _sink = thrash.sum()
+        elif FLUSH != "none":
+            thrash.fill_(i & 0xFF)
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -330,17 +343,25 @@ def analyse(seq_len, kv, q):
 
     def run_full():
         mod.mxfp4_decode_attention_fwd(
-            q, k_packed, v_packed, k_scales, v_scales, o,
-            kv_indptr, kv_indices, 1.0 / (HEAD_DIM**0.5),
-            page_size=PAGE_SIZE, max_kv_splits=max_splits,
-            attn_logits=attn_logits, attn_lse=attn_lse,
-            num_kv_splits=num_kv_splits, block_n=mod._BLOCK_N,
+            q,
+            k_packed,
+            v_packed,
+            k_scales,
+            v_scales,
+            o,
+            kv_indptr,
+            kv_indices,
+            1.0 / (HEAD_DIM**0.5),
+            page_size=PAGE_SIZE,
+            max_kv_splits=max_splits,
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
+            num_kv_splits=num_kv_splits,
+            block_n=mod._BLOCK_N,
             num_warps=num_warps,
         )
 
-    twin_out = torch.empty(
-        BATCH * KV_HEADS * splits, dtype=torch.float32, device=DEV
-    )
+    twin_out = torch.empty(BATCH * KV_HEADS * splits, dtype=torch.float32, device=DEV)
 
     def make_twin(mode):
         lut = mod.e2m1_scale_lut(DEV, torch.bfloat16)
@@ -349,13 +370,27 @@ def analyse(seq_len, kv, q):
 
         def run():
             _twin_kernel[(BATCH, KV_HEADS, splits)](
-                k_packed, v_packed, k_scales, v_scales, lut, lut16, twin_out,
-                kv_indptr, kv_indices, num_kv_splits,
-                k_packed.stride(0), k_packed.stride(1),
-                k_scales.stride(0), k_scales.stride(1),
-                HALF_D=HEAD_DIM // 2, SCALE_BLOCKS=nblk,
-                BLOCK_N=mod._BLOCK_N, MIN_BLOCK_KV=mod._MIN_BLOCK_KV,
-                MODE=mode, num_warps=num_warps, num_stages=2,
+                k_packed,
+                v_packed,
+                k_scales,
+                v_scales,
+                lut,
+                lut16,
+                twin_out,
+                kv_indptr,
+                kv_indices,
+                num_kv_splits,
+                k_packed.stride(0),
+                k_packed.stride(1),
+                k_scales.stride(0),
+                k_scales.stride(1),
+                HALF_D=HEAD_DIM // 2,
+                SCALE_BLOCKS=nblk,
+                BLOCK_N=mod._BLOCK_N,
+                MIN_BLOCK_KV=mod._MIN_BLOCK_KV,
+                MODE=mode,
+                num_warps=num_warps,
+                num_stages=2,
             )
 
         return run
@@ -397,49 +432,75 @@ def analyse(seq_len, kv, q):
     ai = useful / kv_bytes
     floor_ms = total_bytes / (PEAK_READ_GBPS * 1e9) * 1e3
 
-    print(f"\n=== seq_len={seq_len}  splits={splits}  CTAs={head_tiles * splits} "
-          f"warps={num_warps}  {ctas_per_sm} CTA/SM ===")
-    print(f"  traffic   : KV {kv_bytes / 2**20:7.1f} MiB | kv_indices "
-          f"{idx_bytes / 2**20:5.2f} | logits r+w {2 * logit_bytes / 2**20:5.2f} "
-          f"| total {total_bytes / 2**20:7.1f} MiB (L2 = 96 MiB)")
-    print(f"  flops     : useful {useful / 1e9:6.3f} GFLOP | issued "
-          f"{issued / 1e9:6.3f} GFLOP (BLOCK_H {mod._GROUPED_BLOCK_H} vs "
-          f"{valid_h} valid = {issued / useful:.2f}x pad)")
-    print(f"  intensity : {ai:5.1f} FLOP/B useful "
-          f"(ridge {PEAK_BF16_TFLOPS * 1e12 / (PEAK_READ_GBPS * 1e9):5.1f}) "
-          f"-> memory bound")
+    print(
+        f"\n=== seq_len={seq_len}  splits={splits}  CTAs={head_tiles * splits} "
+        f"warps={num_warps}  {ctas_per_sm} CTA/SM ==="
+    )
+    print(
+        f"  traffic   : KV {kv_bytes / 2**20:7.1f} MiB | kv_indices "
+        f"{idx_bytes / 2**20:5.2f} | logits r+w {2 * logit_bytes / 2**20:5.2f} "
+        f"| total {total_bytes / 2**20:7.1f} MiB (L2 = 96 MiB)"
+    )
+    print(
+        f"  flops     : useful {useful / 1e9:6.3f} GFLOP | issued "
+        f"{issued / 1e9:6.3f} GFLOP (BLOCK_H {mod._GROUPED_BLOCK_H} vs "
+        f"{valid_h} valid = {issued / useful:.2f}x pad)"
+    )
+    print(
+        f"  intensity : {ai:5.1f} FLOP/B useful "
+        f"(ridge {PEAK_BF16_TFLOPS * 1e12 / (PEAK_READ_GBPS * 1e9):5.1f}) "
+        f"-> memory bound"
+    )
     print(f"  roofline  : {floor_ms:.4f} ms at {PEAK_READ_GBPS:.0f} GB/s")
-    print(f"  measured  : fwd cold {t_full:.4f} ms (warm/graph {t_full_warm:.4f}) "
-          f"= stage1 {t_s1:.4f} + stage2 {t_s2:.4f}")
-    print(f"  twin cold : loads {t_mem:.4f} | +LUT4096 {t_lut:.4f} "
-          f"| +LUT16*scale {t_lut16:.4f} | +arith {t_arith:.4f} "
-          f"| +cvt*scale {t_cvt_sc:.4f} | +cvt only {t_cvt:.4f} ms")
-    print(f"  --> MBU   : stage1 {total_bytes / (t_s1 / 1e3) / 1e9 / PEAK_READ_GBPS * 100:5.1f}% "
-          f"| twin {total_bytes / (t_mem / 1e3) / 1e9 / PEAK_READ_GBPS * 100:5.1f}% "
-          f"({total_bytes / (t_s1 / 1e3) / 1e9:.0f} GB/s vs twin "
-          f"{total_bytes / (t_mem / 1e3) / 1e9:.0f} GB/s)")
-    print(f"  --> MFU   : useful {useful / (t_s1 / 1e3) / 1e12 / PEAK_BF16_TFLOPS * 100:5.1f}% "
-          f"| issued {issued / (t_s1 / 1e3) / 1e12 / PEAK_BF16_TFLOPS * 100:5.1f}% "
-          f"({useful / (t_s1 / 1e3) / 1e12:.1f} / "
-          f"{issued / (t_s1 / 1e3) / 1e12:.1f} TFLOP/s)")
-    print(f"  --> budget: loads {t_mem:.4f} ({t_mem / t_s1 * 100:.0f}%) "
-          f"| LUT gather +{t_lut - t_mem:.4f} ({(t_lut - t_mem) / t_s1 * 100:.0f}%) "
-          f"| dot+softmax +{t_s1 - t_lut:.4f} ({(t_s1 - t_lut) / t_s1 * 100:.0f}%)")
-    print(f"  --> dequant cost over loads: LUT4096 +{t_lut - t_mem:.4f} | "
-          f"LUT16*scale +{t_lut16 - t_mem:.4f} | arith +{t_arith - t_mem:.4f} | "
-          f"hw-cvt*scale +{t_cvt_sc - t_mem:.4f} | hw-cvt only +{t_cvt - t_mem:.4f} ms")
+    print(
+        f"  measured  : fwd cold {t_full:.4f} ms (warm/graph {t_full_warm:.4f}) "
+        f"= stage1 {t_s1:.4f} + stage2 {t_s2:.4f}"
+    )
+    print(
+        f"  twin cold : loads {t_mem:.4f} | +LUT4096 {t_lut:.4f} "
+        f"| +LUT16*scale {t_lut16:.4f} | +arith {t_arith:.4f} "
+        f"| +cvt*scale {t_cvt_sc:.4f} | +cvt only {t_cvt:.4f} ms"
+    )
+    print(
+        f"  --> MBU   : stage1 {total_bytes / (t_s1 / 1e3) / 1e9 / PEAK_READ_GBPS * 100:5.1f}% "
+        f"| twin {total_bytes / (t_mem / 1e3) / 1e9 / PEAK_READ_GBPS * 100:5.1f}% "
+        f"({total_bytes / (t_s1 / 1e3) / 1e9:.0f} GB/s vs twin "
+        f"{total_bytes / (t_mem / 1e3) / 1e9:.0f} GB/s)"
+    )
+    print(
+        f"  --> MFU   : useful {useful / (t_s1 / 1e3) / 1e12 / PEAK_BF16_TFLOPS * 100:5.1f}% "
+        f"| issued {issued / (t_s1 / 1e3) / 1e12 / PEAK_BF16_TFLOPS * 100:5.1f}% "
+        f"({useful / (t_s1 / 1e3) / 1e12:.1f} / "
+        f"{issued / (t_s1 / 1e3) / 1e12:.1f} TFLOP/s)"
+    )
+    print(
+        f"  --> budget: loads {t_mem:.4f} ({t_mem / t_s1 * 100:.0f}%) "
+        f"| LUT gather +{t_lut - t_mem:.4f} ({(t_lut - t_mem) / t_s1 * 100:.0f}%) "
+        f"| dot+softmax +{t_s1 - t_lut:.4f} ({(t_s1 - t_lut) / t_s1 * 100:.0f}%)"
+    )
+    print(
+        f"  --> dequant cost over loads: LUT4096 +{t_lut - t_mem:.4f} | "
+        f"LUT16*scale +{t_lut16 - t_mem:.4f} | arith +{t_arith - t_mem:.4f} | "
+        f"hw-cvt*scale +{t_cvt_sc - t_mem:.4f} | hw-cvt only +{t_cvt - t_mem:.4f} ms"
+    )
     best = min(t_cvt_sc, t_cvt)
-    print(f"  --> if dequant were hw-cvt: stage1 ~{t_s1 - (t_lut - best):.4f} ms "
-          f"({(best - t_lut) / t_s1 * 100:+.1f}%), MBU "
-          f"{total_bytes / ((t_s1 - (t_lut - best)) / 1e3) / 1e9 / PEAK_READ_GBPS * 100:.1f}%")
-    print(f"  --> gap   : stage1/roofline {t_s1 / floor_ms:.2f}x | "
-          f"stage1/twin {t_s1 / t_mem:.2f}x | twin/roofline {t_mem / floor_ms:.2f}x")
+    print(
+        f"  --> if dequant were hw-cvt: stage1 ~{t_s1 - (t_lut - best):.4f} ms "
+        f"({(best - t_lut) / t_s1 * 100:+.1f}%), MBU "
+        f"{total_bytes / ((t_s1 - (t_lut - best)) / 1e3) / 1e9 / PEAK_READ_GBPS * 100:.1f}%"
+    )
+    print(
+        f"  --> gap   : stage1/roofline {t_s1 / floor_ms:.2f}x | "
+        f"stage1/twin {t_s1 / t_mem:.2f}x | twin/roofline {t_mem / floor_ms:.2f}x"
+    )
 
 
 def main():
     seq_lens = [int(a) for a in sys.argv[1:]] or [65536, 100000, 150000]
-    print(f"GPU={torch.cuda.get_device_name()} "
-          f"peak_read={PEAK_READ_GBPS:.0f} GB/s peak_bf16={PEAK_BF16_TFLOPS:.0f} TFLOP/s")
+    print(
+        f"GPU={torch.cuda.get_device_name()} "
+        f"peak_read={PEAK_READ_GBPS:.0f} GB/s peak_bf16={PEAK_BF16_TFLOPS:.0f} TFLOP/s"
+    )
     kv = make_kv(max(seq_lens) + 16)
     q = torch.randn(
         (BATCH, Q_HEADS, HEAD_DIM),

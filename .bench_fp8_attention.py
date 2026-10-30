@@ -76,6 +76,22 @@ def build_mapping(seq_len, shuffle, gen):
 # comes from index traffic rather than from index *work*. WARM=1 measures the
 # other regime.
 WARM = os.environ.get("WARM") == "1"
+# How to evict L2 between iterations. "write" (fill_) leaves up to an L2's worth
+# of dirty lines that must be written back *while the measured kernel runs*,
+# competing for DRAM bandwidth -- that is bandwidth pollution, not a cold cache.
+# A real decode step evicts a layer's KV with other layers' *reads*, which is a
+# clean eviction, so "read" is the faithful model. Kept selectable because every
+# number in sections 1-5 of the profiling doc was taken with "write".
+FLUSH = os.environ.get("FLUSH", "write")
+
+
+def _evict(thrash, i):
+    if WARM or FLUSH == "none":
+        return
+    if FLUSH == "read":
+        _evict.sink = thrash.sum()
+    else:
+        thrash.fill_(i & 0xFF)
 
 
 def cold_time(run, thrash, iters=ITERS):
@@ -84,8 +100,7 @@ def cold_time(run, thrash, iters=ITERS):
     torch.cuda.synchronize()
     pairs = []
     for i in range(iters):
-        if not WARM:
-            thrash.fill_(i & 0xFF)
+        _evict(thrash, i)
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -102,8 +117,7 @@ def split_stages(run, thrash, iters=20):
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for i in range(iters):
-            if not WARM:
-                thrash.fill_(i & 0xFF)
+            _evict(thrash, i)
             run()
         torch.cuda.synchronize()
     t1 = t2 = 0.0
