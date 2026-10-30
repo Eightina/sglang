@@ -98,7 +98,9 @@ def run(case, seq_lens, q_heads, kv_heads, head_dim, shuffle):
     # actually reads the table; if it does not, the arm silently fell back.
     # Rolling would not do: a single-page sequence rolls to itself.
     engaged = not torch.equal(o_tok, fwd(PS, (page_table + 1) % npages_pool))
-    expect_engaged = q_heads != kv_heads and PS % mod._BLOCK_N == 0
+    # Head shape no longer gates this: the per-head kernel that had no page-table
+    # argument is gone, so kv_group_num == 1 runs the grouped kernel too.
+    expect_engaged = PS % mod._BLOCK_N == 0
 
     tag = "shuffled" if shuffle else "identity"
     ok = same and engaged == expect_engaged
@@ -118,10 +120,10 @@ CASES = [
     ("qwen3 24/4 hd256 batch4 ragged", [64, 191, 512, 1000], 24, 4, 256),
     ("gqa 16/2 hd128", [333], 16, 2, 128),
     ("gqa 8/1 hd64", [777], 8, 1, 64),
-    # kv_group_num == 1 takes the MHA kernel, which has no page-table argument.
-    # The hint must be ignored and the token-level result preserved -- here via
-    # the PAGE_SIZE > 1 token branch, so this also covers that branch.
-    ("mha 4/4 hd128 (must fall back)", [300], 4, 4, 128),
+    # kv_group_num == 1 is the degenerate grid: VALID_BLOCK_H == 1, so one row
+    # of the BLOCK_H tile is valid. Narrowest masking path, and the one the
+    # since-removed per-head kernel used to serve.
+    ("mha 4/4 hd128 (kv_group_num 1)", [300], 4, 4, 128),
 ]
 
 if __name__ == "__main__":

@@ -838,3 +838,90 @@ stage1  0.0796 → 0.0723（假设 WS 把 dequant + dot + softmax 全部藏到�
 
 对照 §6.3 的 0.63 ms 缺口（ITL 的 2.6%，**5 倍于 WS 的天花板**，定位成本半小时）：
 **不做 WS，先查缺口。**
+
+---
+
+## 8. 下一个靶子：写侧量化 kernel（手写 CUDA / PTX）
+
+§7.4 否掉了 WS（天花板 −0.49% ITL），§6.3 留下了唯一一个上限更大的目标：
+**0.63 ms/步 ≈ ITL 的 2.6%** —— decode attention 读路径之外给回去的那部分。
+本节记录它的依据、定位步骤与实现方案，供后续接手。尚未开工。
+
+### 8.1 为什么怀疑写侧量化
+
+依据链（前三条实测，第四条结构观测，第五条推断）：
+
+1. **读路径已经没有空间**：stage1 = 1.10× 于一个跑在 94~97% MBU 的孪生地板（§7.2）。
+2. **kernel 与端到端严重不成比例**：kernel 侧对 FP8 是 −50.4%（读刷 @100k，§7.1），
+   端到端只有 −3.4%（§6）。
+3. **1:1 核算不闭合**：(0.1826 − 0.0906) × 16 层 = 1.47 ms 应得，实得 0.84 ms，
+   **兑现率 57%**。而 combined 行布局那一轮的核算是闭合的（预测 −0.52、实测 −0.47，
+   兑现 90%，§7.3）—— 所以这不是"kernel 收益一般都兑现不了"，而是有一笔**固定开销
+   只长在 MXFP4 这一侧**。
+4. **写侧 kernel 的 grid 形态**（查实）：
+   `_mxfp4_quant_store_kernel[(num_tokens, 2, nkv)]`，bs=1 decode 下是
+   **(1, 2, 4) = 8 个 CTA**，在 170 个 SM 上占 **4.7%**；经 `set_kv_buffer` 每个
+   full-attention 层调用一次，**16 次 launch/步**。
+   参照：stage2 的 24 CTA（14% 的卡）搬 2.1 MB 花 0.0085 ms，而带宽下限是 0.0012 ms。
+5. **推断**：0.63 / 16 = **0.039 ms/层**。该 kernel 每层的真实工作量是
+   1 token × 4 kv head × 2 (K/V) × 256 元素 = **2,048 个元素** —— 0.039 ms 处理两千个
+   元素，只能是 launch 与延迟，不可能是工作量。而 FP8 那一侧是一次 cast，没有块归约。
+
+**第 5 条是推断不是结论。** 必须先定位再动手 —— §4.7 的 stage2 就是因为跳过定位、
+直接按"grid 饿死"下药，白做了一整轮（按 d 维切 CTA 零效果，真因是循环依赖链）。
+
+### 8.2 第一步：一步 decode 的 per-kernel 配对差（半小时）
+
+复用 §1.1 的 profiler，但要的不是排序而是**两套 KV dtype 的配对差**：
+
+```bash
+# 同一 binary、同一上下文、交替占卡
+python .prof_kernel_rank.py <port> 98000 /tmp/prof/<name> 48
+```
+
+把 DECODE trace 里 MXFP4 独有的 kernel（量化 / scatter）总时间除以 32 步，
+看是否接近 0.63 ms。三种结局对应三条不同的后续：
+
+| 结局 | 含义 | 下一步 |
+|---|---|---|
+| 量化 kernel ≈ 0.6 ms/步 | 假设成立 | §8.3 |
+| 量化 kernel 很小，差额散在许多 kernel 上 | 是 launch **数量**而非单个 kernel | 跨层合批 / graph 层面合并 |
+| 差额落在 GDN / norm 上 | 与 KV dtype 无关，归因错了 | 撤回 §6.3 的提法 |
+
+### 8.3 若确认在写侧：kernel 怎么写
+
+现状是 Triton，三个一眼可见的问题，**且都是 Triton 难表达、CUDA 自然表达的**：
+
+1. **grid 饿死（8 CTA）**，但出路不是切更细。§4.7 的教训是「在飞字节恒定时，
+   拿请求尺寸换 CTA 数无效」。这里该消的是 **launch 数**：16 层写同一个池子、
+   彼此无依赖，却被迫一层一次 launch。
+2. **块归约写成 `tl.max(axis=1)`**：32 元素一块、每行 8 块。Triton 按瓦片布局展开；
+   CUDA 里这是一次 `__shfl_xor_sync` 树或一条 `redux.sync.max`（sm80+），
+   32 元素正好半个 warp 幅。
+3. **E2M1 打包是 3 分支 `rint` + 位拼**（`mxfp4_quant.py` 的 `mag_lo/mag_mid/mag_hi`）。
+   SM120 有反方向的硬件指令 `cvt.rn.satfinite.e2m1x2.f32` —— §5 已经在读侧用过它的
+   逆向 `cvt.rn.f16x2.e2m1x2`，并实测 SASS 落到 `F2FP.F16.E2M1.UNPACK_B`。
+   一条指令吃两个 fp32、出一个 packed byte，饱和与 RNE 都在硬件里。
+   > 但记住第一次用硬件 cvt（§5 的 A′）**单独上不赚**，因为瓶颈不在那条通路上。
+   > 这次同样必须先由 §8.2 证明瓶颈真在这里，再动手。
+
+### 8.4 验收口径（不可省）
+
+- **逐位相同**：量化虽有损，但本实现与 eager OCP codec 的契约是 bit-exact
+  （见 `mxfp4_quant.py` 模块 docstring）。新实现须对 bf16/fp16 全域 `torch.equal`，
+  含 E8M0 NaN 字节 0xFF、amax=0 的全零 code、inf 块饱和到 E2M1 max，
+  以及**保留 slot 0**（CUDA-graph padding 写入的约定）。
+- **负对照**：参照 §5.2 —— 两臂一致只能证明一致，不能证明新路径启用了。
+  必须扰动输入并断言输出改变。
+- **端到端用流式 ITL p50**，不得用 e2e 时长相减（`final_lut_profiling.md` §4 的旧口径
+  已被否决）；基线须在**本次**日志里看到 `The server is fired up`（§6.1）。
+- **kernel 侧用读刷**（`FLUSH=read`），不要用默认写刷（§7）。
+
+### 8.5 为什么这件事适合换成 CUDA
+
+前六轮里 Triton 挡住过三次，每次都是"我知道该生成什么 SASS，但表达不出来"：
+`num_warps` 减半换不来每线程寄存器（§2.4 / 前卷）、广播被折回 load 的 layout（§6.2）、
+`setmaxnreg` 在 ptxas 侧静默失效（§1.5）。
+
+写侧量化是第一个**连 grid 形态都需要改**的目标（跨层合批 + warp 级归约 + 硬件 cvt），
+Triton 的 program-per-tile 模型在这里是净阻碍，而不只是表达不便。

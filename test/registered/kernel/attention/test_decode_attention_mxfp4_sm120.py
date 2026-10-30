@@ -187,20 +187,16 @@ REL_L2_CAP = 2e-2
 COSINE_CAP = 0.999
 NORM_RATIO_RANGE = (0.98, 1.02)
 
-# Frozen per-path thresholds (worst * 1.25 from an offline 20-seed sweep on
-# SM120 / torch 2.13.0+cu130). MHA (per-head kernel, fp32 elementwise): the
-# native kernel dequantizes inline in fp32, so both sides consume numerically
-# identical values and the residual is fp32 accumulation order only -- four
-# orders of magnitude tighter than a BF16-materializing (PLAIN) path.
-MXFP4_TRITON_FROZEN_REL_L2 = 3.5e-7
-MXFP4_TRITON_FROZEN_COSINE = 0.9999997
-MXFP4_TRITON_FROZEN_NORM_RATIO = (0.9999998, 1.0000002)
-
-# GQA/MQA (grouped kernel): serves the whole query group with tl.dot over bf16
-# tiles (stock-kernel semantics; the K/V unpack is shared across the group
-# instead of re-read per query head). The bf16 cast is lossless for dequantized
-# E2M1 values; the residual comes from p->bf16 rounding before the PV dot plus
-# the tensor-core accumulation order.
+# Frozen thresholds (worst * 1.25 from an offline 20-seed sweep on SM120 /
+# torch 2.13.0+cu130). One tier, because one kernel serves every head shape:
+# it runs tl.dot over bf16 tiles and shares the K/V unpack across a query
+# group, with MHA as the kv_group_num == 1 degenerate case (one valid row of
+# the BLOCK_H tile). The bf16 cast is lossless for dequantized E2M1 values;
+# the residual comes from p->bf16 rounding before the PV dot plus the
+# tensor-core accumulation order. A since-removed per-head kernel did the same
+# math element-wise in fp32 and held rel_l2 <= 3.5e-7 for MHA shapes; those
+# shapes now sit in this tier instead (measured rel_l2 1.01e-3, cos 1.000000,
+# norm_ratio 0.99999 -- a pure fp32->bf16 fingerprint, not a regression).
 MXFP4_TRITON_GROUPED_FROZEN_REL_L2 = 1.85e-3
 MXFP4_TRITON_GROUPED_FROZEN_COSINE = 0.9999986
 MXFP4_TRITON_GROUPED_FROZEN_NORM_RATIO = (0.9994, 1.0006)
@@ -227,18 +223,10 @@ def _assert_caps(testcase, metrics, context):
     )
 
 
-def _assert_frozen(testcase, metrics, context, grouped=False):
-    rel_cap = (
-        MXFP4_TRITON_GROUPED_FROZEN_REL_L2 if grouped else MXFP4_TRITON_FROZEN_REL_L2
-    )
-    cos_cap = (
-        MXFP4_TRITON_GROUPED_FROZEN_COSINE if grouped else MXFP4_TRITON_FROZEN_COSINE
-    )
-    lo, hi = (
-        MXFP4_TRITON_GROUPED_FROZEN_NORM_RATIO
-        if grouped
-        else MXFP4_TRITON_FROZEN_NORM_RATIO
-    )
+def _assert_frozen(testcase, metrics, context):
+    rel_cap = MXFP4_TRITON_GROUPED_FROZEN_REL_L2
+    cos_cap = MXFP4_TRITON_GROUPED_FROZEN_COSINE
+    lo, hi = MXFP4_TRITON_GROUPED_FROZEN_NORM_RATIO
     testcase.assertLessEqual(
         metrics["rel_l2"],
         rel_cap,
@@ -478,21 +466,19 @@ def _run_decode_case(
     ref = torch.stack(refs, dim=0)
 
     metrics = decode_output_metrics(o, ref)
-    grouped = num_q_heads != num_kv_heads
     if assert_level == "frozen":
-        _assert_frozen(
-            testcase, metrics, f"{layout}_p{page_size}_hd{head_dim}", grouped
-        )
+        _assert_frozen(testcase, metrics, f"{layout}_p{page_size}_hd{head_dim}")
     else:
         _assert_caps(testcase, metrics, f"{layout}_p{page_size}_hd{head_dim}")
     return metrics
 
 
 # (name, q_heads, kv_heads, head_dim, page_size, prefix_lens, layout, kwargs).
-# Representative coverage: MHA per-head path, GQA/MQA grouped path, the Qwen
-# 24q/4kv/256 shape, page-size and physical-layout variants, a long multi-split
-# sequence, and an all-zero (amax==0) request. Pools are in the production
-# combined layout unless a case asks for the separate one.
+# Representative coverage: the kv_group_num == 1 degenerate grid (the "mha"
+# cases -- one valid row of the BLOCK_H tile, the narrowest masking path),
+# GQA/MQA, the Qwen 24q/4kv/256 shape, page-size and physical-layout variants,
+# a long multi-split sequence, and an all-zero (amax==0) request. Pools are in
+# the production combined layout unless a case asks for the separate one.
 _DECODE_CASES = (
     ("mha_hd64_p1_contiguous", 4, 4, 64, 1, (31,), "contiguous", {}),
     ("gqa_hd64_p16_boundary", 4, 2, 64, 16, (14, 15, 16), "shuffled_pages", {}),

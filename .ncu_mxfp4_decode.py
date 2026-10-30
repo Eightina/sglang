@@ -10,6 +10,7 @@ instance per launch.
 Standalone it just reports wall time per launch and the analytic roofline
 inputs, so the ncu-measured traffic can be checked against the model.
 """
+
 import sys
 
 import torch
@@ -65,7 +66,7 @@ def analytic(seq_len, splits):
 def main():
     seq_len = int(sys.argv[1]) if len(sys.argv) > 1 else 100000
     launches = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-    num_warps, ctas_per_sm = mod.stage1_launch_config(Q_HEADS // KV_HEADS, 0)
+    num_warps, ctas_per_sm = mod.stage1_launch_config(0)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     valid_h = min(mod._GROUPED_BLOCK_H, Q_HEADS // KV_HEADS)
     head_tiles = triton.cdiv(Q_HEADS, valid_h)
@@ -93,11 +94,21 @@ def main():
 
     def run():
         mod.mxfp4_decode_attention_fwd(
-            q, k_packed, v_packed, k_scales, v_scales, o,
-            kv_indptr, kv_indices, 1.0 / (HEAD_DIM**0.5),
-            page_size=PAGE_SIZE, max_kv_splits=max_splits,
-            attn_logits=attn_logits, attn_lse=attn_lse,
-            num_kv_splits=num_kv_splits, block_n=mod._BLOCK_N,
+            q,
+            k_packed,
+            v_packed,
+            k_scales,
+            v_scales,
+            o,
+            kv_indptr,
+            kv_indices,
+            1.0 / (HEAD_DIM**0.5),
+            page_size=PAGE_SIZE,
+            max_kv_splits=max_splits,
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
+            num_kv_splits=num_kv_splits,
+            block_n=mod._BLOCK_N,
             num_warps=num_warps,
         )
 

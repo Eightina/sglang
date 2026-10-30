@@ -365,7 +365,7 @@ class TritonAttnBackend(AttentionBackend):
                 head_tiles = triton.cdiv(
                     self.num_head, min(_GROUPED_BLOCK_H, kv_group_num)
                 )
-            _, ctas_per_sm = stage1_launch_config(kv_group_num, model_runner.gpu_id)
+            _, ctas_per_sm = stage1_launch_config(model_runner.gpu_id)
             wave_kv_splits = (
                 max(1, ctas_per_sm * self.device_core_count // head_tiles)
                 if self.device_core_count > 0

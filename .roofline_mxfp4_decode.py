@@ -323,7 +323,7 @@ def analyse(seq_len, kv, q):
     k_packed, v_packed, k_scales, v_scales = kv
     nblk = HEAD_DIM // mod.MXFP4_BLOCK_SIZE
     kv_group = Q_HEADS // KV_HEADS
-    num_warps, ctas_per_sm = mod.stage1_launch_config(kv_group, 0)
+    num_warps, ctas_per_sm = mod.stage1_launch_config(0)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     valid_h = min(mod._GROUPED_BLOCK_H, kv_group)
     head_tiles = triton.cdiv(Q_HEADS, valid_h)

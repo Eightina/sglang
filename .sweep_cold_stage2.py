@@ -14,6 +14,7 @@ at constant bytes in flight; and num_stages beyond 4 regresses.
 
     python .sweep_cold_stage2.py [seq_len ...]
 """
+
 import sys
 
 import torch
@@ -46,7 +47,9 @@ def make_kv(num_slots):
         for packed, scales in ((k_packed, k_scales), (v_packed, v_scales)):
             ref = torch.randn(
                 (end - start, KV_HEADS, HEAD_DIM),
-                dtype=torch.bfloat16, device=DEV, generator=gen,
+                dtype=torch.bfloat16,
+                device=DEV,
+                generator=gen,
             )
             p, s = MXFP4KVQuantizeUtil.batched_quantize(ref)
             packed[start:end], scales[start:end] = p, s
@@ -57,7 +60,7 @@ def main():
     seq_lens = [int(a) for a in sys.argv[1:]] or [100000]
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     kv_group = Q_HEADS // KV_HEADS
-    num_warps, ctas_per_sm = mod.stage1_launch_config(kv_group, 0)
+    num_warps, ctas_per_sm = mod.stage1_launch_config(0)
     valid_h = min(mod._GROUPED_BLOCK_H, kv_group)
     head_tiles = triton.cdiv(Q_HEADS, valid_h)
     max_splits = max(1, ctas_per_sm * sms // head_tiles)
@@ -65,7 +68,9 @@ def main():
     kv = make_kv(max(seq_lens) + 16)
     k_packed, v_packed, k_scales, v_scales = kv
     q = torch.randn(
-        (BATCH, Q_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEV,
+        (BATCH, Q_HEADS, HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=DEV,
         generator=torch.Generator(device=DEV).manual_seed(7),
     )
     thrash = torch.empty(192 * 2**20, dtype=torch.uint8, device=DEV)
@@ -87,18 +92,32 @@ def main():
         s2_bytes = BATCH * Q_HEADS * splits * (HEAD_DIM + 1) * 4
 
         print(f"\n=== seq_len={seq_len} splits={splits} cold L2 ===")
-        print(f"{'stages':>7} {'fwd ms':>8} {'stage1':>8} {'stage2':>8} "
-              f"{'s2 us/split':>12} {'s2 GB/s':>8} {'vs stages=2':>12}  exact")
+        print(
+            f"{'stages':>7} {'fwd ms':>8} {'stage1':>8} {'stage2':>8} "
+            f"{'s2 us/split':>12} {'s2 GB/s':>8} {'vs stages=2':>12}  exact"
+        )
         base_s2, ref = None, None
         for stages in STAGES:
+
             def run(stages=stages):
                 mod.mxfp4_decode_attention_fwd(
-                    q, k_packed, v_packed, k_scales, v_scales, o,
-                    kv_indptr, kv_indices, 1.0 / (HEAD_DIM**0.5),
-                    page_size=PAGE_SIZE, max_kv_splits=max_splits,
-                    attn_logits=attn_logits, attn_lse=attn_lse,
-                    num_kv_splits=num_kv_splits, block_n=mod._BLOCK_N,
-                    num_warps=num_warps, stage2_num_stages=stages,
+                    q,
+                    k_packed,
+                    v_packed,
+                    k_scales,
+                    v_scales,
+                    o,
+                    kv_indptr,
+                    kv_indices,
+                    1.0 / (HEAD_DIM**0.5),
+                    page_size=PAGE_SIZE,
+                    max_kv_splits=max_splits,
+                    attn_logits=attn_logits,
+                    attn_lse=attn_lse,
+                    num_kv_splits=num_kv_splits,
+                    block_n=mod._BLOCK_N,
+                    num_warps=num_warps,
+                    stage2_num_stages=stages,
                 )
 
             for _ in range(3):
@@ -136,9 +155,11 @@ def main():
             if stages == 2:
                 base_s2 = t2
             delta = f"{t2 / base_s2 - 1:+.1%}" if base_s2 else ""
-            print(f"{stages:>7} {total:>8.4f} {t1:>8.4f} {t2:>8.4f} "
-                  f"{t2 * 1e3 / splits:>12.2f} {s2_bytes / (t2 / 1e3) / 1e9:>8.0f} "
-                  f"{delta:>12}  {exact}")
+            print(
+                f"{stages:>7} {total:>8.4f} {t1:>8.4f} {t2:>8.4f} "
+                f"{t2 * 1e3 / splits:>12.2f} {s2_bytes / (t2 / 1e3) / 1e9:>8.0f} "
+                f"{delta:>12}  {exact}"
+            )
 
 
 if __name__ == "__main__":

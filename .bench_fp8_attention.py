@@ -188,7 +188,7 @@ def main():
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
 
     nblk = HEAD_DIM // mod.MXFP4_BLOCK_SIZE
-    num_warps, ctas_per_sm = mod.stage1_launch_config(Q_HEADS // KV_HEADS, 0)
+    num_warps, ctas_per_sm = mod.stage1_launch_config(0)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     valid_h = min(mod._GROUPED_BLOCK_H, Q_HEADS // KV_HEADS)
     head_tiles = triton.cdiv(Q_HEADS, valid_h)
