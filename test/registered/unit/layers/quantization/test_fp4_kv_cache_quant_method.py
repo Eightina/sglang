@@ -387,9 +387,10 @@ class TestMXFP4KVCacheMethod(CustomTestCase):
             KVCacheAttentionAccessKind.NATIVE_FP4,
         )
         self.assertIsNone(method.resolve_attention_access("prefill", "triton"))
-        # 16 layers: 16 KiB packed + 1 KiB E8M0 scales + 4 KiB
-        # one-layer BF16 PLAIN scratch reserve.
-        self.assertEqual(method.compute_cell_size(4, 256, 16, 1), 21 * 1024)
+        # 16 layers: codes and E8M0 scales share one 144-byte row per
+        # (slot, head) -- 128 packed + 8 scales + 8 pad for alignment -- so
+        # 18 KiB of rows, plus 4 KiB of one-layer BF16 PLAIN scratch reserve.
+        self.assertEqual(method.compute_cell_size(4, 256, 16, 1), 22 * 1024)
 
     def test_buffer_shapes_and_plain_roundtrip(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (

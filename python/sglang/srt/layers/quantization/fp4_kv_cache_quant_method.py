@@ -767,6 +767,28 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
     def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
         return torch.float8_e8m0fnu
 
+    # Codes and E8M0 scales share one row per (slot, head) so that the decode
+    # kernel's two loads share one slot/head address expression. That turns the
+    # scale fetch from 8 synchronous ``LDG.E.U8`` into 4 async ``LDGSTS`` riding
+    # the packed stream's pipeline, worth ~20% of stage 1. The row is padded to a
+    # multiple of this: at 136 B the odd rows land on an 8-byte boundary, the
+    # 16-byte async copy cannot form, and the layout is *slower* than keeping the
+    # two tensors apart. See section 2 of mxfp4_decode_layout_ws_profiling.md.
+    ROW_ALIGN = 16
+
+    @classmethod
+    def _row_layout(cls, head_dim: int) -> tuple[int, int, int]:
+        """(packed_dim, scale_offset, row_bytes) for one (slot, head) row."""
+
+        def up(n: int) -> int:
+            return -(-n // cls.ROW_ALIGN) * cls.ROW_ALIGN
+
+        packed_dim = (head_dim + 1) // 2
+        scale_blocks = (head_dim + cls.SCALE_BLOCK_SIZE - 1) // cls.SCALE_BLOCK_SIZE
+        # The scales must start aligned too, else their own copy cannot widen.
+        scale_offset = up(packed_dim)
+        return packed_dim, scale_offset, up(scale_offset + scale_blocks)
+
     def create_buffers(
         self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
     ) -> dict:
@@ -775,27 +797,27 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
         self.head_dim = head_dim
         packed_dim = (head_dim + 1) // 2
         scale_blocks = (head_dim + self.SCALE_BLOCK_SIZE - 1) // self.SCALE_BLOCK_SIZE
+        _, scale_offset, row = self._row_layout(head_dim)
         store_dtype = self.kv_storage_dtype()
-        k_buffer = [
-            torch.zeros((size, head_num, packed_dim), dtype=store_dtype, device=device)
+        # One allocation per layer per side; the four buffers below are
+        # row-strided views into it. Everything downstream reads them through
+        # explicit strides, so no copy is involved -- but the views are *not*
+        # contiguous, which is why the pool tracks the owning rows separately
+        # for slot moves and capacity accounting.
+        k_rows = [
+            torch.zeros((size, head_num, row), dtype=store_dtype, device=device)
             for _ in range(layer_num)
         ]
-        v_buffer = [
-            torch.zeros((size, head_num, packed_dim), dtype=store_dtype, device=device)
+        v_rows = [
+            torch.zeros((size, head_num, row), dtype=store_dtype, device=device)
             for _ in range(layer_num)
         ]
-        k_scale_buffer = [
-            torch.zeros(
-                (size, head_num, scale_blocks), dtype=store_dtype, device=device
-            )
-            for _ in range(layer_num)
-        ]
-        v_scale_buffer = [
-            torch.zeros(
-                (size, head_num, scale_blocks), dtype=store_dtype, device=device
-            )
-            for _ in range(layer_num)
-        ]
+        sl_codes = slice(0, packed_dim)
+        sl_scales = slice(scale_offset, scale_offset + scale_blocks)
+        k_buffer = [t[..., sl_codes] for t in k_rows]
+        v_buffer = [t[..., sl_codes] for t in v_rows]
+        k_scale_buffer = [t[..., sl_scales] for t in k_rows]
+        v_scale_buffer = [t[..., sl_scales] for t in v_rows]
         # Materialize the native decode kernel's fused E2M1 x E8M0 dequant table
         # here (eager init): it is built on first use, and a capture-time build
         # would be baked into the CUDA graph.
@@ -814,6 +836,7 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
             "dq_k_buffer": None,
             "dq_v_buffer": None,
             "store_dtype": store_dtype,
+            "row_buffers": [*k_rows, *v_rows],
         }
 
     def quantize_and_store(
@@ -900,14 +923,11 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
     ) -> int:
-        packed_size = head_num * ((head_dim + 1) // 2) * num_layers * 2 * kv_size
-        scale_size = (
-            head_num
-            * ((head_dim + self.SCALE_BLOCK_SIZE - 1) // self.SCALE_BLOCK_SIZE)
-            * num_layers
-            * 2
-            * kv_size
-        )
+        # Codes and scales live in one padded row (see ``_row_layout``), so the
+        # pad is part of the persistent footprint: 144 B instead of 136 B per
+        # (slot, head) at head_dim 256, i.e. +5.9% capacity for -20% stage-1 time.
+        _, _, row = self._row_layout(head_dim)
+        row_size = head_num * row * num_layers * 2 * kv_size
         # PLAIN materializes one layer's K and V as BF16 simultaneously. Reserve
         # that transient footprint during capacity sizing even though it is not a
         # persistent pool allocation.
@@ -918,7 +938,7 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
             * torch.empty((), dtype=torch.bfloat16).element_size()
             * kv_size
         )
-        return packed_size + scale_size + plain_scratch_size
+        return row_size + plain_scratch_size
 
 
 # Registry: method name -> attention access rules.

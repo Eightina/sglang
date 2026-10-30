@@ -147,3 +147,314 @@ SMEM 越界掉到 1 CTA/SM 而 +70%。所以不能照搬 8 warp（128 producer +
 
 验收仍按前卷的轮次契约：完整 attention stage1+stage2 vs FP8 baseline + MBU，
 先读 `n_regs` / `metadata.shared` 再读时间，输出与现版本做逐位或 frozen 阈值对比。
+
+---
+
+## 2. 第五轮：把 E8M0 scale 并进 packed 行（方向 A，kernel 侧）
+
+### 2.1 做法
+
+一个 `(slot, head)` 的 8 个 scale 字节搬进 packed codes 所在的同一行，行宽
+128 → **144**（128 codes + 8 scales + 8 pad）。kernel 侧只多一个 constexpr：
+
+```python
+offs_sblk_k = SCALE_COL_BASE + tl.arange(0, SCALE_TILE_K)
+```
+
+调用方把**同一个张量**既作 `k_scales` 传入、又以 `[..., :128]` 的行跨视图作
+`k_packed` 传入，并置 `scale_col_base=128`。于是 `ks_row` 与 `k_row` 成为字面相同的
+表达式，编译器只算一次行偏移，而不是再建一个指针瓦片。`SCALE_COL_BASE=0` 是默认值，
+两张量布局的行为逐字节不变。
+
+顺带修掉一处隐患：`mxfp4_decode_attention_fwd` 原本对四个 KV 张量各调一次
+`.contiguous()`。kernel 的槽位/头偏移全部来自 `_extract_kv_strides`，真正的要求只是
+最内维 stride 为 1，于是这四次调用被换成显式检查。原样留着的话，任何行跨视图入参都会
+**每次 decode 静默复制整池**——探针第一版就撞上了，51 MB 的拷贝把 combined 测成
++73%，差点让我把方向 A 判死。
+
+### 2.2 行宽清扫：padding 不是浪费，是异步拷贝的前提
+
+同一探针 (`.probe_combined_row.py`)，只改行宽，输出与两张量版逐位相同：
+
+| 行宽 | 构成 | 行基址对齐 | s1+s2 @100k | vs 两张量 |
+|---|---|---|---|---|
+| 128 | 两张量（基线）| 128 B | 0.1825 | — |
+| **136** | 128 + 8 | **8 B** | 0.2015 | **+10.4%** |
+| 144 | 128 + 8 + 8 | 16 B | 0.1533 | −16.0% |
+| 160 | 128 + 8 + 24 | 32 B | 0.1577 | −13.6% |
+| 256 | 128 + 8 + 120 | 128 B | 0.1508 | −17.4% |
+| P7 | 行宽仍 128，scale 从行内 120..127 读（数值错，只看时间）| 128 B | 0.1387 | −24.0% |
+
+两个读数定住了设计：
+
+- **136 不但不赚还更慢。** 行 stride 136 不是 16 的倍数，奇偶行错位，凑不出 16 字节的
+  异步拷贝。那 8 字节 padding 是**拿来换对齐的**，不是浪费。
+- **160 / 256 并不比 144 好。** 既然 16 B 对齐就够，更宽只是白占内存。144 是最窄的可行宽度。
+- **P7 给出无额外流量时的上限 −24%。** 真实 144 布局拿到 −16%，差的那 8 个点是
+  行宽变宽带来的足迹代价。（此表口径与 §1.1 不同 —— 探针 harness 同步刷 L2、输出 fp32，
+  绝对值整体偏高约 36%；同场相对值有效，跨表不可比。§2.4 是生产口径。）
+
+### 2.3 机制：同步标量读变成异步流水拷贝
+
+stage1 的 SASS 指令直方图（nvdisasm，只列有变化的）：
+
+| 指令 | 两张量 | combined 144 | Δ |
+|---|---|---|---|
+| `LDG.E.U8`（同步标量全局字节读）| 8 | **0** | **−8** |
+| `LDGSTS.E`（异步 global→shared 拷贝）| 0 | **4** | **+4** |
+| `LDS.U8`（shared→reg 字节读）| 0 | **8** | **+8** |
+| `LDGDEPBAR` | 4 | 8 | +4 |
+| `LDGSTS.E.BYPASS.128`（packed 流，未变）| 16 | 16 | 0 |
+| `UIADD3` | 40 | **20** | **−20** |
+| `MOV` | 348 | 314 | −34 |
+| `PRMT` | 185 | 158 | −27 |
+| `LOP3.LUT` | 66 | 49 | −17 |
+| 合计 | 2400 | 2304 | −96 |
+
+这正是 §1.3 预测的那一步，且是逐条可见的：8 条**同步**全局字节读消失，换成 4 条
+**异步**拷贝把 scale 预取进共享内存（多出的 1,024 B = 64 行 × 16 B 就是它的暂存缓冲，
+`LDGDEPBAR` 翻倍是多出的那级流水），consumer 里只剩 8 条廉价的 `LDS.U8`。同时第二个
+指针瓦片的地址算术整体塌掉——`UIADD3` 减半，uniform datapath 的 `MOV`/`PRMT`/`LOP3`
+链各掉 34/27/17 条。
+
+值得记一笔：**这就是 LeetCUDA 第 15 章归因给 warp specialization 的那一层收益**
+（搬运从 consumer 指令流里移出、交给异步引擎），而这里是在 Triton 内靠改布局拿到的，
+没写一行 CUDA。
+
+### 2.4 结果（生产口径：`.bench_fp8_attention.py`，冷 L2，bs=1）
+
+| seq | FP8 ms | 两张量 ms | **combined ms** | s1 两张量 → combined | **vs FP8** | MBU 两张量 → combined |
+|---|---|---|---|---|---|---|
+| 8,192 | 0.0312 | 0.0294 | **0.0257** | 0.0193 → 0.0157 (−18.7%) | **−17.5%** | 26.7% → 30.5% |
+| 32,768 | 0.0687 | 0.0599 | **0.0480** | 0.0505 → 0.0394 (−22.0%) | **−30.2%** | 40.0% → 49.9% |
+| 65,536 | 0.1211 | 0.0957 | **0.0786** | 0.0862 → 0.0697 (−19.1%) | **−35.1%** | 47.4% → 57.7% |
+| 100,000 | 0.1804 | 0.1348 | **0.1064** | 0.1254 → 0.0980 (−21.9%) | **−41.0%** | 50.4% → 63.8% |
+| 150,000 | 0.2666 | 0.1899 | **0.1491** | 0.1798 → 0.1403 (−22.0%) | **−44.1%** | 53.0% → 67.5% |
+
+- stage1 稳定 **−19~22%**；stage2 不动（0.0077 → 0.0079~0.0083），符合预期。
+- **@150k MXFP4 的 MBU 67.5% 已经追平 FP8 的 68.3%** —— 在搬运 1.81× 更少字节的前提下
+  达到同样的带宽饱和度。这是本项目第一次做到。
+- 对照 §1.2 的 P3 天花板（@100k −49.4%），本轮吃掉了其中约 **83%**。剩下的 ~8 个点是
+  那 8 条 `LDS.U8` 与残余寻址，只有 WS / TMA 能再动。
+
+占用率（stage1 grouped，`BLOCK_N=64`/4 warps）：
+
+| | 两张量 | combined 144 |
+|---|---|---|
+| regs / spills | 206 / 0 | **208 / 0** |
+| smem | 43,008 B | **44,032 B** |
+| CTA/SM | 2（rf 2、smem 2）| **2（rf 2、smem 2）** |
+
+SMEM 只涨 1,024 B，距 2 CTA/SM 的 51,200 B 门槛仍有 7,168 B 余量。
+
+正确性：行宽 136/144/160/256 四种布局的输出与两张量版 `torch.equal` 全部为真；
+`test_decode_attention_mxfp4_sm120.py` 4 passed + 6 subtests。
+
+### 2.5 代价：KV cache 多占 5.9%
+
+每 token 每层：两张量 2 × 4 × (128 + 8) = 1,088 B → combined 2 × 4 × 144 = **1,152 B**，
+**+5.88%**。流量不变（padding 从不被读，§2.4 的 MiB 列两版相同），涨的是**容量**：同样的
+`mem-fraction-static` 下可容 token 数降约 5.6%。换 −41% 的 decode 延迟，这笔交易是划算的，
+但必须计进 `compute_cell_size`，不能当成免费。
+
+两条能把这 5.9% 退回去的布局（都更大，留给后续）：
+
+- **K/V 同行**：128 K codes + 128 V codes + 8 + 8 = **272 B = 17 × 16**，零 padding 且行基址
+  天然 16 B 对齐。代价是 K/V 不再是两个独立张量，prefill 侧与"K/V 互不蹭 L2 行"的计量假设都要重做。
+- **page 化**：一页 16 token 排成 16 × 128 codes + 16 × 8 scales = **2,176 B = 17 × 128**，
+  零 padding 且 codes 行跨回到 128 B。需要 `page_size ≥ 16`，而这正是 §1.5 约束 ① 要求的
+  TMA 前提——两件事可以一起做。
+
+### 2.6 下一步
+
+落地顺序：先把 144 B 行宽接到 pool / 量化 / prefill 三层（§1.7 的改动面已摸清），
+拿到端到端 ITL；再按 §1.6 重评方向 B——届时残余空间只有 P3 口径的 ~8 个点加上孪生地板的
+那一段，是否值得写 CUDA 需要重新算。
+
+---
+
+## 3. 第五轮落地：把 144 B 行接到 pool / 量化 / sizing 三层
+
+### 3.1 落地形态：一次分配，四个行跨视图
+
+关键简化：**不需要给 kernel 加任何参数。** `MXFP4KVCacheMethod.create_buffers` 每层每侧
+只分配一个 `[slots, heads, 144]` 张量，四个 buffer 全是它的视图：
+
+```python
+k_rows = [torch.zeros((size, head_num, row), ...) for _ in range(layer_num)]
+k_buffer       = [t[..., :packed_dim]                           for t in k_rows]
+k_scale_buffer = [t[..., scale_offset : scale_offset + nblk]    for t in k_rows]
+```
+
+scale 视图的 `data_ptr` 自带 +128 偏移，而两个视图的 slot/head stride 完全相同，于是
+`ks_row` 与 `k_row` 本来就是同一个表达式——§2 里那个 `SCALE_COL_BASE` constexpr 被撤掉了。
+同口径对比两种写法（SASS 指令直方图）：
+
+| | `LDG.E.U8` | `LDGSTS.E` | `LDS.U8` | `UIADD3` | 总指令 |
+|---|---|---|---|---|---|
+| 两张量 | 8 | 0 | 0 | 40 | 2400 |
+| `scale_col_base=128` | 0 | 4 | 8 | 20 | 2304 |
+| **四视图（落地形态）** | **0** | **4** | **8** | 21 | **2296** |
+
+视图形态**还少 8 条指令**（列偏移里不用加常量），且不改 kernel API。行宽由
+`_row_layout(head_dim)` 统一给出：`(packed_dim, scale_offset, row)`，两处都向上对齐到
+`ROW_ALIGN = 16`（scale 的起始也要对齐，否则它自己那条拷贝同样凑不宽）。
+
+### 3.2 四个"假设了连续性"的地方
+
+视图不是连续张量，pool 里有四处隐含假设必须改，其中一处是**真 bug**：
+
+| 位置 | 原逻辑 | 问题 | 处理 |
+|---|---|---|---|
+| `_init_data_ptrs_and_strides` | `data_strides = prod(shape[1:]) * itemsize` | 视图算出 512 而真实行跨是 576，slot-move 会**写错内存** | 改用 `x.stride(0) * itemsize`，对连续张量取值不变 |
+| `_slot_move_pointer_buffers` | 列出 4 个 buffer | 视图的 stride 互相覆盖对方的字节 | 行拥有者存在时返回它们（2 项即覆盖全部，拷贝量也更少）|
+| `get_kv_size_bytes` | 累加四个视图 | 少算 padding，低报真实占用 | 走行拥有者 |
+| `_pd_registerable_tensors` / `_build_kv_buffer_descs` | 注册 `k_buffer`/`v_buffer` | **原本就漏注册 scale**（PD 传输会丢 scale）| 注册整行，顺带把这个旧缺口修好 |
+
+为此 pool 多了一个 `kv_row_buffers` 字段：recipe 若用一次分配支撑多个视图就填它，否则为
+`None`、全部退回原路径。
+
+### 3.3 容量计账的漂移（启动 OOM 的真因）
+
+第一次起服务直接 OOM，而日志里 `#tokens` 还是改造前的 **160,109**。原因不是分配器：
+
+> `pool_configurator._compute_cell_size` 把 MXFP4 的字节公式**内联复制了一份**，
+> 而 `MXFP4KVCacheMethod.compute_cell_size`（我改的那个）**只有测试在调用**。
+> 于是 pool 按 144 B 分配、sizer 仍按 136 B 预算，静默超配约 0.15 GB。
+
+两处已统一到 `_row_layout` 这一个来源，并在注释里写明它们曾经漂移过。修好后：
+
+| | tokens | K size | V size | avail |
+|---|---|---|---|---|
+| 两张量 | 160,109 | 1.30 GB | 1.30 GB | 4.46 GB |
+| combined 144 | **152,831** | 1.31 GB | 1.31 GB | 4.52 GB |
+
+容量 −4.5%（比 §2.5 估的 5.6% 小，因为 PLAIN scratch 那一项不随行宽变）。
+相对 FP8 的 105,071 token 仍是 **1.454×**（原 1.524×）。
+
+### 3.4 端到端：同 binary A/B
+
+`Qwen3.8-27B-NVFP4`，98k 上下文 / 96 输出 token / 流式 ITL p50，各 3 次重复：
+
+| 布局 | tokens | ITL p50 | spread | decode | vs 两张量 |
+|---|---|---|---|---|---|
+| 两张量 | 160,109 | 24.58 ms | 0.01 | 40.69 tok/s | — |
+| **combined 144** | 152,831 | **24.11 ms** | 0.06 | **41.48 tok/s** | **−1.9%** |
+
+（两张量那一臂是把 pool 临时改回四张分配跑的，量完已还原，残留标记已核查为 0。
+24.58 ms 与**前卷** §3.5 旧记录的 24.65 ms 吻合，说明两次 harness 可比。）
+
+**核算对得上**：kernel 侧 @98k 每层省 0.1348 − 0.1064 = 0.0284 ms，乘 16 个
+full-attention 层 = **预测 −0.454 ms/步**，实测 **−0.47 ms/步**。
+kernel 收益 1:1 落到端到端，没有被调度或其它开销吃掉。
+
+同时也量出了这条路线的上限：attention 现在只占一步的 ~5.9%（1.70 / 24.11 ms），
+**剩下 94% 是权重 GEMM 底盘**。所以 −41% 的 attention 收益只能兑现成 −1.9% 的 ITL；
+这不是实现问题，是分母问题。
+
+### 3.5 回归
+
+`test_decode_attention_mxfp4_sm120.py` + `test_mxfp4_kv_pool.py` +
+`test_fp4_kv_cache_quant_method.py`：**29 passed + 8 subtests**。
+
+decode kernel 的用例表原先只造四张连续张量，**完全没覆盖生产布局**（行跨视图在
+shape 上看不出来）。已补 `_make_pools(…, pool_layout)`：默认 `combined`，并保留
+`qwen_24_4_256_separate_pools` / `mha_hd64_p1_separate_pools` 两例继续覆盖旧形态。
+
+写入侧 `quant_store_kv_mxfp4` 原本就全程走显式 stride，视图开箱可用；实测
+fused 写入后的 codes 与 scales 与 eager codec 参考实现 `torch.equal` 为真，行内 padding
+保持为零。
+
+### 3.6 下一步
+
+方向 A 结束。当前位置（cold L2 @100k）：0.1064 ms、MBU 63.8%、对 FP8 −41.0%；
+@150k MBU 67.5% 已追平 FP8。
+
+按 §1.6 重评方向 B 时要带上 §3.4 这个新事实：
+
+- kernel 侧残余空间 = P3 口径的 ~8 个点 + 孪生地板那一段（MBU 63.8% → ~89%）；
+- 但端到端杠杆是 **1 : 0.046**（attention 占 5.9%）。即使再把 attention 砍半，ITL 也只动 ~3%。
+
+所以写 CUDA 做 TMA + WS 的理由不能再建立在"端到端提速"上。若要继续，值得的是
+**page 化本身**（§2.5 那条零 padding 的 `[page, head, tok_in_page, …]` 布局）：它既退回
+5.9% 的容量，又是 §1.5 约束 ① 的解除条件，收益与风险都比直接写 WS 清楚。
+
+---
+
+## 4. 定向：页表索引读是下一个同类杠杆（更正 §1.5 约束 ①）
+
+目标回到 **kernel 本身**，所以 §3.6 那条"端到端杠杆只有 1:0.046"不构成停止的理由，
+只是说明收益要按 kernel 口径记。本节先更正一处事实错误，再给下一轮的定价。
+
+### 4.1 现状：`page_size = 1`，且不是 MXFP4 的限制
+
+实测服务 `server_args` 为 `'page_size': 1`（服务端默认值），
+`'enable_page_major_kv_layout': False`。`fp4_kv_cache_quant_method.py` 里**没有任何**
+page_size 约束，decode kernel 也有 `PAGE_SIZE > 1` 分支、单测覆盖 page_size=16。
+
+### 4.2 更正：调大 `--page-size` 对 kernel 是净负收益
+
+§1.5 把约束 ① 写成「`page_size=1` 使 K/V 成为 gather，TMA 表达不了，需要
+`page_size ≥ BLOCK_N`」。**这个因果链是错的。** 真实情况：
+
+- 池子是 slot-major `[slots, heads, row]`，而 `kv_indices` **无论 page_size 多大都存
+  token 级 slot id**（kernel 里 `page_id = kv_loc // PAGE_SIZE` 就是在从 token id 反推），
+  所以 kernel 永远是逐 token gather —— 这与 page_size 无关。
+- `_extract_kv_strides` 给出 `page_stride = slot_stride * page_size`、
+  `tok_stride = slot_stride`，于是
+  `page_id * page_stride + tok_in_p * tok_stride ≡ slot_stride * kv_loc`，
+  **代数上完全等价**。
+
+实测（head_dim 256 / combined 144 / 同输入）：
+
+| | regs | smem | 总指令 | 输出 |
+|---|---|---|---|---|
+| `page_size=1` | 208 | 44,032 | 2,296 | — |
+| `page_size=64` | 208 | 44,032 | **2,352（+56）** | 逐位相同 |
+
+多出来的 56 条全是把 `kv_loc` 拆开再乘回去的开销（`SHF.R.S32.HI` +16、`IMAD` +16、
+`LOP3.LUT` +8、`LEA.HI` +8、`IADD` +8）。所以**现成的 `PAGE_SIZE > 1` 分支在 slot-major
+池子上是严格的悲观化**；调 `--page-size` 只改分配器（一页内 slot id 连续），对 kernel 而言
+就是 §1.2 的 P6 效果 ≈ −1%。
+
+### 4.3 P8：给页表机制定价 = stage1 的 −7%
+
+真正的杠杆与 §2 同类：把**逐 token 的索引读及其 gather 寻址**从内层循环拿掉，
+改成 page 粒度（一个 tile 读 1 个 page id，地址对 `offs_n` 仿射）。探针做法：
+
+```python
+kv_loc = cur_batch_kv_start_idx + offs_n   # P8，替掉 tl.load(kv_indices + ...)
+```
+
+恒等页表下这与原式**完全等价**，已核：8k 序列输出 `torch.equal` 为真。
+所以下表不是数值变化的假象：
+
+| seq | 臂 | s1 现状 | s1 + P8 | Δ | 总计 vs FP8 | MBU |
+|---|---|---|---|---|---|---|
+| 100,000 | combined 144 | 0.0976 | **0.0912** | **−6.6%** | −40.4% → **−44.4%** | 63.2% → **67.7%** |
+| 150,000 | combined 144 | 0.1396 | **0.1288** | **−7.7%** | −44.5% → **−48.1%** | 68.1% → **73.0%** |
+| 100,000 | 两张量 | 0.1249 | 0.1202 | −3.8% | −28.3% | 52.5% |
+
+@150k 的 MBU 会到 **73.0%**，首次**超过** FP8 的 68.5%。
+
+### 4.4 修正后的杠杆排序（kernel 口径）
+
+| 杠杆 | 实测定价 | 需要什么 | 风险 |
+|---|---|---|---|
+| **D. 页表索引改 page 粒度** | s1 **−7%** | `kv_indices` 按 page 存 + kernel 循环重排；要求 `page_size ≥ BLOCK_N`（=64），否则一个 tile 跨多页、仍需多次索引读 | 纯 Triton；动的是 backend 的 metadata 构造，不动数值 |
+| E. 残余至孪生地板 | MBU 73% → ~89% | TMA + WS，写 CUDA | §1.5 约束 ②（寄存器池 vs 2 CTA/SM）仍未解除 |
+
+**约束 ① 的正确形式**：TMA 需要的是"一个 tile 来自一段常量跨度的 2D box"。
+slot-major 池子里 `[tok_in_page, row]` 的跨度本来就是常量（`slot_stride`），
+所以缺的不是布局连续性，而是**一个 tile 只对应一个 page id** —— 即 `page_size ≥ BLOCK_N`
+加上 page 粒度的索引。这恰好就是杠杆 D 的前提，两者仍然是一条链，但理由换了。
+
+### 4.5 下一步
+
+做杠杆 D。要落地的面比 §3 小但不在同一层：
+
+- `kv_indices` 的生成侧（`triton_backend` 的 metadata）改成 page 粒度，或在 kernel 内按
+  `offs_n // PAGE_SIZE` 只取每页首个；
+- `PAGE_SIZE > 1` 分支要重写成"读 page id → 仿射"，而不是现在的"读 token id → 拆回 page"；
+- 服务需以 `--page-size 64` 起（BLOCK_N=64），radix cache 的页粒度与命中率随之变化，
+  这部分要单独量，不能只看 kernel。

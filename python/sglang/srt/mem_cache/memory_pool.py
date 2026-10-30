@@ -2129,6 +2129,7 @@ class MHATokenToKVPool(KVCache):
             self.v_scale_buffer = None
             self.dq_k_buffer = None
             self.dq_v_buffer = None
+            self.kv_row_buffers = None
             if self.post_capture_active:
                 self._alloc_post_capture_buffers()
             else:
@@ -2162,6 +2163,12 @@ class MHATokenToKVPool(KVCache):
         self.v_scale_buffer = buf.get("v_scale_buffer")
         self.dq_k_buffer = buf.get("dq_k_buffer")
         self.dq_v_buffer = buf.get("dq_v_buffer")
+        # A recipe may back several of the buffers above with one allocation and
+        # hand out row-strided views (MXFP4 puts codes and scales in one row).
+        # When it does, these own the memory: slot moves and capacity accounting
+        # must go through them, since the views neither cover the padding nor
+        # report a contiguous row stride.
+        self.kv_row_buffers = buf.get("row_buffers")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
         self._check_quantized_buffer_access_requirements()
 
@@ -2206,6 +2213,10 @@ class MHATokenToKVPool(KVCache):
         must update both. This list feeds data_ptrs/data_strides; it does not
         copy tensor contents by itself.
         """
+        # When codes and scales share a row, one copy per row moves both, and
+        # the views would each report a stride that overlaps the other's bytes.
+        if getattr(self, "kv_row_buffers", None) is not None:
+            return list(self.kv_row_buffers)
         buffers = [*self.k_buffer, *self.v_buffer]
         if getattr(self, "k_scale_buffer", None) is not None:
             buffers.extend([*self.k_scale_buffer, *self.v_scale_buffer])
@@ -2230,7 +2241,10 @@ class MHATokenToKVPool(KVCache):
         )
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                # Bytes between consecutive slots. Taken from the stride rather
+                # than the trailing shape, which would be wrong for a buffer
+                # that is a row-strided view of a wider allocation.
+                x.stride(0) * x.dtype.itemsize
                 for x in slot_move_pointer_buffers
             ],
             device=self.device,
@@ -2312,7 +2326,11 @@ class MHATokenToKVPool(KVCache):
         # Derive from the real buffers when they exist (covers arbitrary layouts,
         # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
         # post-capture call, which only runs for NHD/HND.
-        if self.k_buffer and self.v_buffer:
+        if getattr(self, "kv_row_buffers", None) is not None:
+            # k/v_buffer are views into these; describe the owning rows so a span
+            # covers the padding and the scales that share the row.
+            k_shape = v_shape = tuple(self.kv_row_buffers[0].shape)
+        elif self.k_buffer and self.v_buffer:
             k_shape = tuple(self.k_buffer[0].shape)
             v_shape = tuple(self.v_buffer[0].shape)
         else:
@@ -2381,6 +2399,8 @@ class MHATokenToKVPool(KVCache):
             del self.dq_k_buffer
         if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
             del self.dq_v_buffer
+        if getattr(self, "kv_row_buffers", None) is not None:
+            del self.kv_row_buffers
         if self._post_capture_owner is not None:
             self._post_capture_owner.close()
             self._post_capture_owner = None
@@ -2388,6 +2408,14 @@ class MHATokenToKVPool(KVCache):
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
+        if getattr(self, "kv_row_buffers", None) is not None:
+            # The k/v/scale buffers are views into these, so summing the views
+            # would report the logical bytes and miss the row padding, which is
+            # really allocated. The list holds the K rows then the V rows.
+            half = len(self.kv_row_buffers) // 2
+            k_size_bytes = get_tensor_size_bytes(self.kv_row_buffers[:half])
+            v_size_bytes = get_tensor_size_bytes(self.kv_row_buffers[half:])
+            return k_size_bytes, v_size_bytes
         k_size_bytes = get_tensor_size_bytes(self.k_buffer)
         v_size_bytes = get_tensor_size_bytes(self.v_buffer)
         if getattr(self, "k_scale_buffer", None) is not None:
@@ -2402,6 +2430,11 @@ class MHATokenToKVPool(KVCache):
     def _pd_registerable_tensors(self):
         """Buffers to register for PD KV transfer, in ``_kv_buffer_descs`` order.
         Override when the registerable storage differs from k/v_buffer."""
+        # A combined row carries its scales, so registering the owning rows
+        # transfers data and scales together; registering the code views would
+        # silently drop the scales.
+        if getattr(self, "kv_row_buffers", None) is not None:
+            return list(self.kv_row_buffers)
         return self.k_buffer + self.v_buffer
 
     def get_contiguous_buf_infos(self):

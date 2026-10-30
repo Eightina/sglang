@@ -565,11 +565,15 @@ def _mxfp4_grouped_decode_stage1_kernel(
     byte_mask_v = offs_halfv < PACKED_V_DIM
     # Scales are read at their natural width -- one byte per 16 packed bytes --
     # and fanned out in registers. Indexing them with ``offs_half // 16`` instead
-    # builds a [BLOCK_N, HALF_D] pointer tile to fetch 512 B of distinct data;
-    # ptxas dedupes that to 8 scalar ``LDG.E.U8`` per thread, but those 8
-    # scattered L1 transactions cost as many memory instructions as the entire
-    # packed stream (16 async 128-bit copies) for 6% of the bytes -- 36% of
-    # stage 1 (see section 5.6 of the profiling log).
+    # builds a [BLOCK_N, HALF_D] pointer tile to fetch 512 B of distinct data.
+    # Narrowing the tile does not help: ptxas already dedupes it to 4 scalar
+    # loads per thread per tensor, which is the floor for this dot-operand
+    # layout. Whether those are synchronous ``LDG.E.U8`` or ride along in the
+    # packed stream's async pipeline is decided by the pool layout, not here: if
+    # the scale view shares the codes' slot/head strides (the combined 144-byte
+    # row), the two row offsets become one expression and the fetch turns into
+    # ``LDGSTS`` + ``LDS.U8``, worth 20% of stage 1. See section 2 of
+    # ``mxfp4_decode_layout_ws_profiling.md``.
     offs_sblk_k = tl.arange(0, SCALE_TILE_K)
     offs_sblk_v = tl.arange(0, SCALE_TILE_V)
 
@@ -635,9 +639,10 @@ def _mxfp4_grouped_decode_stage1_kernel(
                 mask=tok_mask[:, None] & byte_mask_k[None, :],
                 other=0,
             )
+            k_blk_ok = offs_sblk_k[None, :] < NUM_K_BLOCKS
             ksbytes = tl.load(
                 K_Scales + ks_row[:, None] + offs_sblk_k[None, :],
-                mask=tok_mask[:, None] & (offs_sblk_k[None, :] < NUM_K_BLOCKS),
+                mask=tok_mask[:, None] & k_blk_ok,
                 other=0,
             )
             k_scale = _broadcast_scale(ksbytes, BLOCK_N, SCALE_TILE_K, HALF_D)
@@ -663,9 +668,10 @@ def _mxfp4_grouped_decode_stage1_kernel(
                 mask=tok_mask[:, None] & byte_mask_v[None, :],
                 other=0,
             )
+            v_blk_ok = offs_sblk_v[None, :] < NUM_V_BLOCKS
             vsbytes = tl.load(
                 V_Scales + vs_row[:, None] + offs_sblk_v[None, :],
-                mask=tok_mask[:, None] & (offs_sblk_v[None, :] < NUM_V_BLOCKS),
+                mask=tok_mask[:, None] & v_blk_ok,
                 other=0,
             )
             v_scale = _broadcast_scale(vsbytes, BLOCK_N, SCALE_TILE_V, HALF_DV)
@@ -864,10 +870,23 @@ def mxfp4_decode_attention_fwd(
     if q.shape[0] != kv_indptr.shape[0] - 1:
         raise ValueError("kv_indptr must have batch + 1 entries")
 
-    k_packed = k_packed.view(torch.uint8).contiguous()
-    v_packed = v_packed.view(torch.uint8).contiguous()
-    k_scales = k_scales.view(torch.uint8).contiguous()
-    v_scales = v_scales.view(torch.uint8).contiguous()
+    # Only the innermost dimension has to be packed: every slot/head offset the
+    # kernels use comes from ``_extract_kv_strides``, so a row-strided view (as a
+    # combined codes+scales layout produces) is read correctly as-is. Calling
+    # ``.contiguous()`` here instead would silently copy the whole pool on every
+    # decode for such a view.
+    k_packed = k_packed.view(torch.uint8)
+    v_packed = v_packed.view(torch.uint8)
+    k_scales = k_scales.view(torch.uint8)
+    v_scales = v_scales.view(torch.uint8)
+    for name, buf in (
+        ("k_packed", k_packed),
+        ("v_packed", v_packed),
+        ("k_scales", k_scales),
+        ("v_scales", v_scales),
+    ):
+        if buf.stride(-1) != 1:
+            raise ValueError(f"{name} must be contiguous along the last dim")
     num_k_blocks = k_scales.shape[-1]
     num_v_blocks = v_scales.shape[-1]
 

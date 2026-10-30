@@ -20,6 +20,7 @@ import torch
 from sglang.kernels.ops.attention.decode_attention_mxfp4_sm120 import (
     mxfp4_decode_attention_fwd,
 )
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import MXFP4KVCacheMethod
 from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -304,6 +305,45 @@ def _build_req_locs(layout, seq_lens, num_slots, seed):
     raise ValueError(f"unknown loc layout {layout!r}")
 
 
+def _make_pools(num_slots, num_kv_heads, head_dim, pool_layout):
+    """(k, v, k_scale, v_scale) uint8 pools in one of the two storage layouts.
+
+    ``combined`` mirrors ``MXFP4KVCacheMethod.create_buffers``: codes and scales
+    share one padded row per (slot, head), so the four buffers are row-strided
+    views of a single allocation. That is what the kernel sees in a server, and
+    the shared slot/head addressing is what lets the scale fetch ride the packed
+    stream's async pipeline -- a path worth covering explicitly, since nothing
+    about it is visible in the buffers' shapes. ``separate`` is the plain
+    four-contiguous-tensors form, still accepted by the kernel.
+    """
+    packed_dim = head_dim // 2
+    num_blocks = head_dim // 32
+
+    def alloc(width):
+        return torch.zeros(
+            (num_slots, num_kv_heads, width), dtype=torch.uint8, device=_DEVICE
+        )
+
+    if pool_layout == "separate":
+        return (
+            alloc(packed_dim),
+            alloc(packed_dim),
+            alloc(num_blocks),
+            alloc(num_blocks),
+        )
+    if pool_layout != "combined":
+        raise ValueError(f"unknown pool layout {pool_layout!r}")
+    _, scale_off, row = MXFP4KVCacheMethod._row_layout(head_dim)
+    k_rows, v_rows = alloc(row), alloc(row)
+    scales = slice(scale_off, scale_off + num_blocks)
+    return (
+        k_rows[..., :packed_dim],
+        v_rows[..., :packed_dim],
+        k_rows[..., scales],
+        v_rows[..., scales],
+    )
+
+
 def _run_decode_case(
     testcase,
     *,
@@ -313,6 +353,7 @@ def _run_decode_case(
     page_size,
     prefix_lens,
     layout="shuffled_pages",
+    pool_layout="combined",
     seed=20260903,
     zero_first_request=False,
     max_kv_splits=8,
@@ -328,17 +369,8 @@ def _run_decode_case(
     num_blocks = head_dim // 32
     scaling = head_dim**-0.5
 
-    k_pool = torch.zeros(
-        (num_slots, num_kv_heads, packed_dim), dtype=torch.uint8, device=_DEVICE
-    )
-    v_pool = torch.zeros(
-        (num_slots, num_kv_heads, packed_dim), dtype=torch.uint8, device=_DEVICE
-    )
-    ks_pool = torch.zeros(
-        (num_slots, num_kv_heads, num_blocks), dtype=torch.uint8, device=_DEVICE
-    )
-    vs_pool = torch.zeros(
-        (num_slots, num_kv_heads, num_blocks), dtype=torch.uint8, device=_DEVICE
+    k_pool, v_pool, ks_pool, vs_pool = _make_pools(
+        num_slots, num_kv_heads, head_dim, pool_layout
     )
 
     req_locs = _build_req_locs(layout, seq_lens, num_slots, seed)
@@ -419,13 +451,34 @@ def _run_decode_case(
 # (name, q_heads, kv_heads, head_dim, page_size, prefix_lens, layout, kwargs).
 # Representative coverage: MHA per-head path, GQA/MQA grouped path, the Qwen
 # 24q/4kv/256 shape, page-size and physical-layout variants, a long multi-split
-# sequence, and an all-zero (amax==0) request.
+# sequence, and an all-zero (amax==0) request. Pools are in the production
+# combined layout unless a case asks for the separate one.
 _DECODE_CASES = (
     ("mha_hd64_p1_contiguous", 4, 4, 64, 1, (31,), "contiguous", {}),
     ("gqa_hd64_p16_boundary", 4, 2, 64, 16, (14, 15, 16), "shuffled_pages", {}),
     ("mqa_hd64_p16_bsz1", 4, 1, 64, 16, (7,), "shuffled_pages", {}),
     ("qwen_24_4_256_p16", 24, 4, 256, 16, (31,), "shuffled_pages", {}),
     ("qwen_24_4_256_multisplit_long", 24, 4, 256, 16, (255,), "shuffled_pages", {}),
+    (
+        "qwen_24_4_256_separate_pools",
+        24,
+        4,
+        256,
+        16,
+        (31,),
+        "shuffled_pages",
+        {"pool_layout": "separate"},
+    ),
+    (
+        "mha_hd64_p1_separate_pools",
+        4,
+        4,
+        64,
+        1,
+        (31,),
+        "contiguous",
+        {"pool_layout": "separate"},
+    ),
     (
         "qwen_24_4_256_zero_req",
         24,
